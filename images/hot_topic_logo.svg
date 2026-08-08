@@ -1,0 +1,69 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 340" width="1200" height="340" role="img" aria-label="hot_topic: measuring stance in text corpora">
+  <defs>
+    <linearGradient id="heat" x1="0" y1="1" x2="1" y2="0">
+      <stop offset="0%" stop-color="#440154"/>
+      <stop offset="35%" stop-color="#3b528b"/>
+      <stop offset="65%" stop-color="#21918c"/>
+      <stop offset="100%" stop-color="#fde725"/>
+    </linearGradient>
+    <linearGradient id="flame" x1="0" y1="1" x2="0" y2="0">
+      <stop offset="0%" stop-color="#440154"/>
+      <stop offset="50%" stop-color="#b5367a"/>
+      <stop offset="100%" stop-color="#fde725"/>
+    </linearGradient>
+    <pattern id="grid" width="24" height="24" patternUnits="userSpaceOnUse">
+      <path d="M24 0H0V24" fill="none" stroke="#ffffff" stroke-opacity="0.05" stroke-width="1"/>
+    </pattern>
+  </defs>
+
+  <rect width="1200" height="340" fill="#0d0b14"/>
+  <rect width="1200" height="340" fill="url(#grid)"/>
+
+  <!-- storefront awning: mall-shop nod, scalloped edge -->
+  <g>
+    <rect x="60" y="52" width="1080" height="20" fill="url(#heat)"/>
+    <g fill="url(#heat)" opacity="0.85">
+      <circle cx="80" cy="76" r="20"/><circle cx="120" cy="76" r="20"/>
+      <circle cx="160" cy="76" r="20"/><circle cx="200" cy="76" r="20"/>
+      <circle cx="240" cy="76" r="20"/><circle cx="280" cy="76" r="20"/>
+      <circle cx="320" cy="76" r="20"/><circle cx="360" cy="76" r="20"/>
+      <circle cx="400" cy="76" r="20"/><circle cx="440" cy="76" r="20"/>
+      <circle cx="480" cy="76" r="20"/><circle cx="520" cy="76" r="20"/>
+      <circle cx="560" cy="76" r="20"/><circle cx="600" cy="76" r="20"/>
+      <circle cx="640" cy="76" r="20"/><circle cx="680" cy="76" r="20"/>
+      <circle cx="720" cy="76" r="20"/><circle cx="760" cy="76" r="20"/>
+      <circle cx="800" cy="76" r="20"/><circle cx="840" cy="76" r="20"/>
+      <circle cx="880" cy="76" r="20"/><circle cx="920" cy="76" r="20"/>
+      <circle cx="960" cy="76" r="20"/><circle cx="1000" cy="76" r="20"/>
+      <circle cx="1040" cy="76" r="20"/><circle cx="1080" cy="76" r="20"/>
+      <circle cx="1120" cy="76" r="20"/>
+    </g>
+  </g>
+
+  <!-- flame mark inside a speech bubble: topic on fire -->
+  <g transform="translate(96,150)">
+    <path d="M0 26 A26 26 0 0 1 26 0 H118 A26 26 0 0 1 144 26 V96 A26 26 0 0 1 118 122 H58 L30 150 V122 H26 A26 26 0 0 1 0 96 Z"
+          fill="none" stroke="url(#heat)" stroke-width="4"/>
+    <path d="M72 26 C64 52 44 58 44 80 a28 28 0 0 0 56 0 c0 -16 -10 -22 -14 -34 -6 12 -12 10 -12 -2 0 -8 -2 -14 -2 -18 z"
+          fill="url(#flame)"/>
+  </g>
+
+  <!-- wordmark -->
+  <g font-family="Helvetica Neue, Helvetica, Arial, sans-serif">
+    <text x="300" y="212" font-size="112" font-weight="700" letter-spacing="-3" fill="#f5f3f7">hot_</text>
+    <text x="520" y="212" font-size="112" font-weight="700" letter-spacing="-3" fill="url(#heat)">topic</text>
+    <text x="302" y="256" font-size="23" font-weight="500" letter-spacing="5" fill="#9a94a8">
+      STRUCTURAL TOPIC MODELS &#183; LLM ANNOTATION &#183; DEFENSIBLE STANCE
+    </text>
+  </g>
+
+  <!-- prevalence sparkline: the thing the pipeline actually produces -->
+  <g transform="translate(300,278)">
+    <path d="M0 30 L60 22 L120 26 L180 12 L240 16 L300 4 L360 10 L420 2"
+          fill="none" stroke="url(#heat)" stroke-width="3" stroke-linecap="round"/>
+    <path d="M0 38 L60 34 L120 36 L180 30 L240 33 L300 27 L360 31 L420 26"
+          fill="none" stroke="#3b528b" stroke-width="2" stroke-opacity="0.7" stroke-linecap="round"/>
+    <text x="440" y="34" font-family="Helvetica Neue, Helvetica, Arial, sans-serif"
+          font-size="17" fill="#6f6880">topic prevalence, 26 years</text>
+  </g>
+</svg>
