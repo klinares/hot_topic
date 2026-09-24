@@ -1,13 +1,13 @@
 topic,label,description,proposition,prevalence,avepp
-1,National Restoration,These paragraphs are about a national effort to restore and rebuild after a period of failure and decline.,The government should prioritize national rebuilding efforts over other policy initiatives.,0.07717658040750673,0.5099225432495229
-2,Inaugural Address,"These paragraphs are about a government leader's speech on a significant day, referencing the nation's past and promising progress amidst crisis.",NA,0.10636476822827338,0.5516750816956002
-3,American Society,"These paragraphs discuss American values and government in relation to liberty, freedom, and the nation's ability to solve problems and protect its people.",NA,0.09463341090359231,0.5044218902798838
-4,Law Enforcement,"The paragraphs discuss the enforcement of laws, including amendments, and their impact on the negro race and the country.",NA,0.06468824619408556,0.5402465620043458
-5,International Peace,These paragraphs are about efforts to achieve peace and prosperity in the world through international cooperation and the application of technical knowledge.,NA,0.10242645771893238,0.5739581377606777
+1,Reconstruction Task,"The paragraphs discuss the need for national reconstruction, restoration, and readjustment after a period of failure and decay, with a focus on correcting evil without impairing the good.",National reconstruction efforts should prioritize correcting past mistakes over preserving existing successes.,0.07717658040750673,0.5099225432495229
+2,Inauguration Speech,"The paragraphs are about a government leader's speech on a significant day, referencing the nation's past and promising progress amidst a crisis.",NA,0.10636476822827338,0.5516750816956002
+3,American Society,"These paragraphs discuss American values and government in relation to problems, liberty, and the nation.",NA,0.09463341090359231,0.5044218902798838
+4,Law Enforcement,"The paragraphs discuss the enforcement of laws, including the thirteenth and fourteenth amendments, and the administration of these laws by the Executive branch of government.",NA,0.06468824619408556,0.5402465620043458
+5,International Peace,"These paragraphs are about promoting peace and stability in the world through various means, including economic development and cooperation among nations.",NA,0.10242645771893238,0.5739581377606777
 6,American Renewal,These paragraphs are about Americans working together to address challenges and renew their country.,NA,0.14782186765819716,0.523138199020286
-7,Constitutional Powers,These paragraphs are about the distribution of powers between the federal government and the states as granted by the constitution.,NA,0.07138189596894069,0.5718548062327181
-8,Military Defense,"These paragraphs are about the importance of maintaining a strong military force, including the navy and army, to secure the country against invasion and other dangers.",NA,0.05287699418873451,0.5465683772849963
-9,Presidential Speech,"These paragraphs are about presidential speeches that mention offers of unity and change to fellow citizens and other government leaders, including a vice president and a speaker.",NA,0.08926579308136649,0.5438749466308094
-10,Government Union,The paragraphs discuss the importance of harmony and balance within the government and union of a country.,NA,0.05978773910027264,0.6129653466271728
-11,Inaugural Address,These paragraphs are about a public official expressing gratitude and acknowledging the trust placed in them by citizens upon assuming a high office.,NA,0.08165424072107536,0.6170993347988186
-12,Government Finance,"These paragraphs are about government revenue, taxation, and expenditures.",NA,0.05192200582902282,0.6090081256415394
+7,Constitutional Powers,These paragraphs discuss the distribution of powers between the federal government and the states as granted by the constitution.,NA,0.07138189596894069,0.5718548062327181
+8,Military Defense,"These paragraphs are about the importance of maintaining a strong military, including the navy and army, to secure the country against invasion and other dangers.",NA,0.05287699418873451,0.5465683772849963
+9,Presidential Issues,"The paragraphs are about presidential speeches that include terms like vice, health, change, and references to notable figures such as the President, Vice President, and other government officials.",NA,0.08926579308136649,0.5438749466308094
+10,Government Union,The paragraphs discuss the importance of harmony and balance within the government and union of states in the country.,NA,0.05978773910027264,0.6129653466271728
+11,Inaugural Duties,These paragraphs are about a public official expressing gratitude and acknowledging the trust placed in them by citizens upon assuming a high office.,NA,0.08165424072107536,0.6170993347988186
+12,Government Finance,"These paragraphs are about government revenue, expenditures, and taxation.",NA,0.05192200582902282,0.6090081256415394

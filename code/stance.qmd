@@ -1,6 +1,6 @@
 ---
 title: "Stance measurement for one topic"
-subtitle: "Script 3 of 3: proposition, census classification, trend over time"
+subtitle: "Script 3 of 4: proposition, census classification, trend over time"
 format:
   typst:
     toc: false
@@ -64,6 +64,9 @@ st <- list(
 
   window_n = 300L,  # calls allowed per quota window PER model
   window_wait = 4L * 60L * 60L,  # seconds to sleep at the window boundary
+  min_theta = 0,  # scope floor: drop paragraphs whose modal topic share is
+                  # below this (0 keeps the census; raise it when AvePP is low)
+  min_class_n = 10L,  # paragraphs a stance class needs before a trend is fit
   era_width = 5L,  # year grouping for the era table
   df_spline = 3L,  # spline df for the trend curve
   n_gold = 100L,  # paragraphs sent for human coding
@@ -93,6 +96,7 @@ if (isTRUE(st$use_openrouter))
 `02_topics.qmd` assigned every paragraph its modal STM topic. This script measures stance on **all** paragraphs of one topic, so there is no sampling and no sampling error: the proportions below are exact for the corpus. The budget is handled by time rather than by design, classifying `r st$window_n` paragraphs per quota window and sleeping until the reset, which makes the method portable to any corpus size without retuning a sample.
 
 ```{r frame}
+#| results: asis
 paragraph_theta <- readr::read_csv(p_out("paragraph_theta.csv"),
                                    show_col_types = FALSE)
 topic_summary   <- readr::read_csv(p_out("topic_summary.csv"),
@@ -101,10 +105,19 @@ stopifnot("02_topics.qmd must supply modal topic and text" =
             all(c("para_uid", "atom_id", "Year", "text", "topic",
                   "theta_max") %in% names(paragraph_theta)))
 
-frame <- paragraph_theta |>
+frame_all <- paragraph_theta |>
   dplyr::filter(topic == st$topic) |>
   dplyr::select(para_uid, atom_id, Year, n_tokens, text, theta_max)
-if (nrow(frame) == 0) stop("No paragraphs for topic ", st$topic, ".")
+# Modal assignment is fuzzy when AvePP is low: a paragraph can be "in" this
+# topic at a share of 0.2 while really being about something else, and such
+# paragraphs come back irrelevant. min_theta removes them as a documented
+# scope restriction; the default of 0 keeps the full census.
+frame <- dplyr::filter(frame_all, theta_max >= st$min_theta)
+if (nrow(frame) == 0) stop("No paragraphs for topic ", st$topic,
+                           " at min_theta = ", st$min_theta, ".")
+writeLines(glue::glue("Scope: {nrow(frame)} of {nrow(frame_all)} paragraphs \
+  have a topic share of at least {st$min_theta} (median share \
+  {round(stats::median(frame_all$theta_max), 2)})."))
 
 n_windows <- ceiling(nrow(frame) / st$window_n)
 glue::glue("Topic {st$topic}: {nrow(frame)} paragraphs from \\
@@ -161,9 +174,13 @@ if (is.na(codebook$proposition[codebook$topic == st$topic]) ||
                            st$topic, ".")
   codebook$proposition[codebook$topic == st$topic] <- draft$proposition
   readr::write_csv(codebook, cb_path)
-  glue::glue("DRAFT proposition written for topic {st$topic}. Edit \\
-              {basename(cb_path)} before classifying: it is the measurement \\
-              target and it enters every stance prompt.")
+  # Stop here. The draft is unreviewed, and classifying with it would spend a
+  # full census of calls on a measurement target nobody has read. Edit the
+  # proposition, then render again; the next render finds it filled and runs.
+  writeLines(glue::glue("DRAFT proposition written for topic {st$topic}: \\
+    \"{draft$proposition}\". Review and edit it in {basename(cb_path)}, \\
+    then render again. Nothing was classified."))
+  knitr::knit_exit()
 }
 
 cb <- codebook |> dplyr::filter(topic == st$topic)
@@ -259,12 +276,32 @@ glue::glue("{dplyr::n_distinct(store$para_uid)} paragraphs labeled by \\
 
 Agreement between raters is reliability, not accuracy: both can be wrong together. Kappa is reported with raw agreement and the confusion table, because kappa alone has no validated interpretive thresholds.
 
+The overall figure mixes two different judgments, and they fail for different reasons. **Relevance** asks whether a paragraph addresses the proposition at all; it depends on how the proposition is worded and how broadly each model reads it. **Direction** asks which side a paragraph takes, among paragraphs both raters agree are relevant. When relevance agreement is low but direction agreement is high, the models read positions consistently and disagree only about scope, and the fix is a sharper proposition or a stricter scope floor, not different models.
+
 ```{r reliability}
+#| results: asis
 wide <- store |> dplyr::filter(!is.na(label)) |>
   tidyr::pivot_wider(names_from = rater, values_from = label)
-ag <- agreement(wide[[2]], wide[[3]], dnn = names(wide)[2:3])
-glue::glue("Agreement over {ag$n} paragraphs: kappa = {round(ag$kappa, 3)}, \\
-            raw = {round(ag$raw, 3)}")
+r1 <- wide[[2]]; r2 <- wide[[3]]
+ag  <- agreement(r1, r2, dnn = names(wide)[2:3])
+rel_ag <- agreement(r1 != "irrelevant", r2 != "irrelevant",
+                    dnn = str_c(names(wide)[2:3], " relevant"))
+both <- r1 != "irrelevant" & r2 != "irrelevant"
+dir_ag <- if (sum(both) > 1) agreement(r1[both], r2[both],
+                                       dnn = names(wide)[2:3]) else NULL
+tibble::tibble(
+  judgment = c("overall (four labels)", "relevance (relevant or not)",
+               "direction (both raters call it relevant)"),
+  paragraphs = c(ag$n, rel_ag$n, dir_ag$n %||% sum(both)),
+  kappa = round(c(ag$kappa, rel_ag$kappa, dir_ag$kappa %||% NA), 3),
+  raw_agreement = round(c(ag$raw, rel_ag$raw, dir_ag$raw %||% NA), 3)) |>
+  tbl_paged(caption = "Rater agreement, split into relevance and direction. Low relevance agreement with high direction agreement points at the proposition's wording, not at the models.")
+writeLines(glue::glue("Paragraphs judged relevant: {names(wide)[2]} \\
+  {sum(r1 != 'irrelevant')}, {names(wide)[3]} {sum(r2 != 'irrelevant')}, \\
+  both {sum(both)}, of {length(r1)}."))
+```
+
+```{r confusion}
 ag$confusion
 ```
 
@@ -306,99 +343,119 @@ if (file.exists(gold_in)) {
 
 # Results
 
+Estimates are shown for **both raters side by side**. The raters can disagree systematically, most often about whether a paragraph addresses the proposition at all, and a result that holds for one rater but not the other depends on the choice of model rather than on the text. Reading the two together makes that visible instead of hiding it behind whichever model happens to be listed first.
+
 ```{r estimates}
 #| results: asis
+# Eras are anchored to round years (1850-1854, 1855-1859, ...) so bins are
+# comparable across topics, whatever year a topic first appears.
 est <- frame |>
-  dplyr::inner_join(store |> dplyr::filter(rater == raters$step[1],
-                                           !is.na(label)),
-                    by = "para_uid") |>
-  dplyr::mutate(oppose = as.integer(label == "oppose"),
-                era = str_c(floor((Year - min(Year)) / st$era_width) *
-                              st$era_width + min(Year), "s"))
+  dplyr::inner_join(dplyr::filter(store, !is.na(label)), by = "para_uid") |>
+  dplyr::mutate(
+    era_start = floor(Year / st$era_width) * st$era_width,
+    era = str_c(era_start, "-", era_start + st$era_width - 1L))
 
 est |>
-  dplyr::count(era, label) |>
-  dplyr::group_by(era) |>
+  dplyr::count(rater, era_start, era, label) |>
+  dplyr::group_by(rater, era) |>
   dplyr::mutate(p = round(n / sum(n), 3)) |>
   dplyr::ungroup() |>
-  tidyr::pivot_wider(id_cols = era, names_from = label, values_from = p,
-                     values_fill = 0) |>
-  tbl_paged(caption = "Stance proportions by era. Every paragraph in the topic was classified, so these are exact for the corpus and carry no sampling error; the live uncertainty is rater misclassification, quantified by the human-coded metrics above.")
+  tidyr::pivot_wider(id_cols = c(era_start, era, rater), names_from = label,
+                     values_from = p, values_fill = 0) |>
+  dplyr::arrange(era_start, rater) |>
+  dplyr::select(-era_start) |>
+  tbl_paged(caption = "Stance proportions by era and rater. Every paragraph in the topic was classified, so these are exact for the corpus and carry no sampling error; the live uncertainty is rater misclassification, quantified by the human-coded metrics above.")
 ```
 
-The trend curve is a different kind of statement. It treats the corpus as one realization of a comment-generating process, so its interval is model-based, not design-based, with **cluster-robust standard errors on the comment** because paragraphs from one author are correlated. The exact era proportions above need no interval; the curve does, and the two should not be mixed in a single sentence.
+The trend panels are a different kind of statement. They treat the corpus as one realization of a comment-generating process, so each interval is model-based, not design-based, with cluster-robust standard errors on the comment because paragraphs from one author are correlated. The exact era proportions above need no interval; the curves do, and the two should not be mixed in a single sentence.
+
+A curve is drawn only where the data can support one. A stance class needs at least `r st$min_class_n` paragraphs in it and `r st$min_class_n` outside it among the relevant paragraphs, spread over more years than the spline has degrees of freedom, and the fit must not *separate*: if every relevant paragraph after some year carries the same label, the logistic curve pins to 0 or 1 and its interval fills the whole panel, which is an artifact rather than an estimate. Classes that fail show their observed yearly shares only, and the table below says why.
 
 ```{r trend}
-#| fig-cap: "Share of relevant paragraphs in each stance, by year. Lines are cluster-robust spline fits with 95 percent intervals where the class supports one; points are the observed yearly shares, shown in every panel so a sparse class is still visible."
-#| fig-height: 4
-rel <- est |> dplyr::filter(label != "irrelevant")
+#| fig-cap: "Share of relevant paragraphs in each stance, by rater and year. Lines are cluster-robust spline fits with 95 percent intervals, drawn only where the class has enough support and does not separate; points are the observed yearly shares, shown in every panel."
+#| fig-height: 5.5
+#| results: asis
+rel <- dplyr::filter(est, label != "irrelevant")
 stances <- c("favor", "neutral", "oppose")
+grid <- tidyr::expand_grid(rater = unique(rel$rater), stance = stances)
 
-# What each class actually has to work with. Read this before the plot: a class
-# with few positives or few distinct years cannot support a spline, and the
-# panel will show observed points only.
-counts <- rel |>
-  dplyr::filter(label %in% stances) |>
-  dplyr::group_by(stance = label) |>
-  dplyr::summarise(n = dplyr::n(), years = dplyr::n_distinct(Year),
-                   .groups = "drop")
-print(counts)
+# One fit per rater and stance; every outcome is recorded with its reason.
+fits <- purrr::pmap(grid, function(rater, stance) {
+  d <- rel |> dplyr::filter(.data$rater == !!rater) |>
+    dplyr::mutate(y = as.integer(label == stance))
+  why <- class_support(d$y, d$Year, st$df_spline, st$min_class_n)
+  out <- if (is.null(why)) tryCatch(trend_curve(d, "y", "atom_id", st$df_spline),
+                                    error = function(e) conditionMessage(e))
+  list(rater = rater, stance = stance, n = sum(d$y), n_rel = nrow(d),
+       curve = if (is.data.frame(out)) out,
+       status = if (is.data.frame(out)) "fitted" else (why %||% out))
+})
+support <- purrr::map(fits, ~ tibble::tibble(rater = .x$rater, stance = .x$stance,
+  paragraphs = .x$n, relevant = .x$n_rel, result = as.character(.x$status))) |>
+  purrr::list_rbind()
+tbl_paged(support, caption = "Trend support by rater and stance: fitted, or the reason no curve is drawn.")
 
-# Observed yearly share per stance, computed for all three regardless of fit.
+tr <- purrr::keep(fits, ~ !is.null(.x$curve)) |>
+  purrr::map(~ dplyr::mutate(.x$curve, rater = .x$rater, stance = .x$stance)) |>
+  purrr::list_rbind() %||% tibble::tibble()  # empty when no class supports a fit
+if (nrow(tr)) readr::write_csv(tr, p_tag("stance_trend"))
+
 obs <- rel |>
-  dplyr::count(Year, label) |>
-  dplyr::group_by(Year) |>
+  dplyr::count(rater, Year, label) |>
+  dplyr::group_by(rater, Year) |>
   dplyr::mutate(share = n / sum(n)) |>
   dplyr::ungroup() |>
   dplyr::filter(label %in% stances) |>
   dplyr::mutate(stance = factor(label, levels = stances))
 
-# Fit each class, reporting failures rather than dropping the class.
-fit_one <- function(s) {
-  d <- rel |> dplyr::mutate(y = as.integer(label == s))
-  out <- tryCatch(trend_curve(d, "y", "atom_id", st$df_spline),
-                  error = function(e) {
-                    message("[", s, "] no spline fit: ", conditionMessage(e))
-                    NULL
-                  })
-  if (is.null(out)) NULL else dplyr::mutate(out, stance = s)
-}
-tr <- purrr::map(stances, fit_one) |> purrr::compact() |> purrr::list_rbind()
-if (nrow(tr)) {
-  tr <- dplyr::mutate(tr, stance = factor(stance, levels = stances))
-  readr::write_csv(tr, p_tag("stance_trend"))
-}
-
 p <- ggplot(mapping = aes(Year)) +
-  geom_point(data = obs, aes(y = share, color = stance), alpha = .45,
-             size = 1) +
-  facet_wrap(~ stance, ncol = 3, drop = FALSE) +
+  geom_point(data = obs, aes(y = share, color = stance), alpha = .5, size = 1) +
+  facet_grid(rater ~ stance, drop = FALSE) +
   scale_color_viridis_d(end = .85, drop = FALSE, guide = "none") +
   scale_fill_viridis_d(end = .85, drop = FALSE, guide = "none") +
   scale_y_continuous(limits = c(0, 1)) +
   labs(x = NULL, y = "share of relevant paragraphs", title = cb$label,
-       subtitle = glue::glue("{nrow(rel)} of {nrow(est)} paragraphs address the proposition"))
+       subtitle = glue::glue("Relevant paragraphs: {str_c(names(table(rel$rater)), ' ', table(rel$rater), collapse = ', ')} of {nrow(frame)}"))
 if (nrow(tr))
   p <- p +
-    geom_ribbon(data = tr, aes(ymin = lo, ymax = hi, fill = stance),
-                alpha = .2) +
-    geom_line(data = tr, aes(y = fit, color = stance), linewidth = .8)
+    geom_ribbon(data = dplyr::mutate(tr, stance = factor(stance, levels = stances)),
+                aes(ymin = lo, ymax = hi, fill = stance), alpha = .2) +
+    geom_line(data = dplyr::mutate(tr, stance = factor(stance, levels = stances)),
+              aes(y = fit, color = stance), linewidth = .8)
 print(p)
 ```
 
 # How many paragraphs would have sufficed?
 
-Because the topic was censused, this costs nothing: subsample the labeled paragraphs at increasing sizes, refit the trend, and measure how far each fitted curve sits from the full-census curve. Comments are subsampled rather than paragraphs, so each replicate has the clustered shape a real collection would have. Where the curve flattens is the point past which more classification buys little, and that number, not a formula, is what should size the next corpus.
+Because the topic was censused, this costs nothing: subsample the labeled paragraphs at increasing sizes, refit the trend, and measure how far each fitted curve sits from the full-census curve. Comments are subsampled rather than paragraphs, so each replicate has the clustered shape a real collection would have. The curve is computed for the fitted stance class with the most support, preferring the first rater and falling back to the second when the first has no fitted class. Small subsamples often separate even when the census does not; those replicates are skipped, and the count kept is reported. If no class supports a census curve, there is nothing to recover and the section says so.
 
 ```{r recovery}
-#| fig-cap: "Mean absolute deviation from the full-census trend curve, by subsample size. Points are replicates; the line is the mean. The flattening point is the practical sample size for this topic."
-rec <- recovery_curve(est, "oppose", st$rec_sizes[st$rec_sizes < nrow(est)],
-                      st$rec_reps, st$df_spline)
-readr::write_csv(rec, p_tag("recovery_curve"))
-ggplot(rec, aes(n_actual, mad)) +
-  geom_point(alpha = 0.4, color = viridis(1, begin = 0.35)) +
-  geom_smooth(se = FALSE, color = viridis(1, begin = 0.6), linewidth = 0.8) +
-  labs(x = "paragraphs classified", y = "mean absolute deviation from census")
+#| results: asis
+# Prefer the first rater, but fall back to any rater with a fitted class:
+# recovery is about sample size, and either rater's labels can show it.
+rec_class <- support |>
+  dplyr::filter(result == "fitted") |>
+  dplyr::arrange(rater != raters$step[1], dplyr::desc(paragraphs)) |>
+  dplyr::slice_head(n = 1)
+rec <- if (nrow(rec_class) == 0) NULL else {
+  d <- rel |> dplyr::filter(rater == rec_class$rater) |>
+    dplyr::mutate(y = as.integer(label == rec_class$stance))
+  recovery_curve(d, "y", st$rec_sizes[st$rec_sizes < nrow(d)],
+                 st$rec_reps, st$df_spline)
+}
+if (is.null(rec) || nrow(rec) == 0) {
+  writeLines("No stance class supports a census trend for this topic, so there is no curve to recover. Improve the proposition or raise the scope floor first.")
+} else {
+  readr::write_csv(rec, p_tag("recovery_curve"))
+  writeLines(glue::glue("Recovery of the '{rec_class$stance}' curve \\
+    ({rec_class$rater}, {rec_class$paragraphs} paragraphs); {nrow(rec)} of \\
+    {length(st$rec_sizes[st$rec_sizes < nrow(d)]) * st$rec_reps} replicates \\
+    could be fitted."))
+  print(ggplot(rec, aes(n_actual, mad)) +
+    geom_point(alpha = 0.5, color = viridis(1, begin = 0.35)) +
+    labs(x = "paragraphs classified", y = "mean absolute deviation from census",
+         title = "Deviation from the census trend by subsample size"))
+}
 ```
 
 # Documentation
@@ -420,12 +477,14 @@ emit_data_dict(
          vars = list(para_uid = "Paragraph id", rater = "Pipeline step that produced the label",
                      label = "favor, neutral, oppose, or irrelevant")),
     list(name = "stance_trend", path = p_tag("stance_trend"), data = tr,
-         description = "Fitted P(oppose) by year with cluster-robust intervals.",
+         description = "Fitted share of relevant paragraphs in each supported stance class, by rater and year, with cluster-robust intervals.",
          vars = list(Year = "Calendar year", fit = "Fitted probability",
                      lo = "Lower 95% bound", hi = "Upper 95% bound",
                       se_ratio = "Robust/naive SE ratio; the clustering cost",
+                     rater = "Pipeline step that produced the labels",
                      stance = "Which stance this curve estimates")),
-    list(name = "recovery_curve", path = p_tag("recovery_curve"), data = rec,
+    list(name = "recovery_curve", path = p_tag("recovery_curve"),
+         data = rec %||% tibble::tibble(),
          description = "Deviation from the census trend by subsample size.",
          vars = list(n_target = "Requested subsample size", rep = "Replicate index",
                      n_actual = "Paragraphs actually drawn", mad = "Mean absolute deviation"))),

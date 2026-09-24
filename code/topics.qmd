@@ -1,6 +1,6 @@
 ---
 title: "Topic model and topic codebook"
-subtitle: "Script 2 of 3: STM, modal assignment, prevalence trends, labels"
+subtitle: "Script 2 of 4: STM, modal assignment, prevalence trends, labels"
 format:
   typst:
     toc: false
@@ -17,7 +17,7 @@ execute:
 
 ```{=html}
 <!--
-RUN ORDER (script 2 of 3; reads 01_preprocess.qmd outputs)
+RUN ORDER (script 2 of 4; reads 01_preprocess.qmd outputs)
   1. Render with tx$run_searchK = TRUE (hours), read the diagnostics, set
      tx$K, flip it back.
   2. Render with tx$run_sensitivity = TRUE once, to show the parse floor
@@ -29,6 +29,7 @@ script 1 is rerun and paragraphs.csv changes, this script stops by name and
 tells you what to delete, instead of reloading a stale fit.
 OUTPUTS (all in outputs/): paragraph_theta.csv, topic_summary.csv,
 topic_codebook.csv, topic_trends.csv, stm_fit.rds, stm_year_effects.rds.
+Then render 03_stance.qmd per topic, and 04_dashboard.qmd for the dashboard.
 -->
 ```
 
@@ -202,7 +203,7 @@ paragraph_theta <- meta |> dplyr::bind_cols(tibble::as_tibble(theta))
 
 # Modal topic assignment and its diagnostics
 
-Each paragraph is assigned its **modal** topic, so topics partition the corpus (mutually exclusive, collectively exhaustive) and can serve as sampling strata in Script 2. This is the same move as modal class assignment in latent class analysis, and it inherits the same caveat: a modal assignment is an estimate, not an observation, and treating it as observed pushes classification error downstream. Two LCA diagnostics report how much error to expect. **Entropy $R^2$** summarizes overall assignment sharpness on a 0-1 scale; **AvePP**, the average posterior probability among a topic's own assigned paragraphs, does it per topic, with about 0.7 the conventional floor. Unlike LCA, STM supplies no classification error matrix over modal assignment, so no BCH-style correction is available here; the honest substitutes are the `min_theta` scope floor in Script 2 and its sensitivity analysis.
+Each paragraph is assigned its **modal** topic, so topics partition the corpus (mutually exclusive, collectively exhaustive) and each paragraph belongs to exactly one topic's frame in `03_stance.qmd`. This is the same move as modal class assignment in latent class analysis, and it inherits the same caveat: a modal assignment is an estimate, not an observation, and treating it as observed pushes classification error downstream. Two LCA diagnostics report how much error to expect. **Entropy $R^2$** summarizes overall assignment sharpness on a 0-1 scale; **AvePP**, the average posterior probability among a topic's own assigned paragraphs, does it per topic, with about 0.7 the conventional floor. Unlike LCA, STM supplies no classification error matrix over modal assignment, so no BCH-style correction is available here; the honest substitute is the `min_theta` scope floor in `03_stance.qmd`, which drops paragraphs that only weakly belong to their modal topic.
 
 ```{r modal}
 #| results: asis
@@ -314,7 +315,7 @@ Two passes, deliberately shaped:
 
 **Pass 2, one manager call** with the larger model (`manager` step). Blind drafting has one predictable failure: two topics can come back with near-duplicate labels even though their term distributions differ. The manager sees all K labels with their FREX terms and resolves collisions. Its mandate is deliberately narrow, stated in the prompt and enforced by the schema: it may **rename only**. It cannot merge topics, split them, change a description, or reorder anything, because the topic structure is the statistical model's output and an LLM should not be permitted to override it.
 
-The `proposition` column is written empty here. Script 2 fills it for the one topic it processes, since propositions are stance targets and you only need them for the topics you actually analyze.
+The `proposition` column is written empty here. `03_stance.qmd` fills it for the one topic it processes, since propositions are stance targets and you only need them for the topics you actually analyze.
 
 ```{r codebook}
 #| results: asis
@@ -403,30 +404,56 @@ if (file.exists(cb_path)) {
   # The manager is advisory: its output is applied ONLY if it returns exactly
   # one label per topic with no topics invented or lost. Any deviation and the
   # blind drafts stand, because a malformed rename must never reshape the
-  # codebook silently.
-  final <- if (!is.null(mgr) && length(mgr$topics) == nrow(drafts)) {
-    renamed <- purrr::map(mgr$topics, ~ tibble(topic = as.integer(.x$topic),
-                                               label_new = .x$label)) |>
+  # codebook silently. ellmer converts an array of objects into a data frame,
+  # so both shapes are accepted; checking length() of a data frame counts its
+  # columns, which is how a valid response can be rejected without anyone
+  # noticing. The status line below says which path was taken.
+  mgr_tbl <- if (is.null(mgr)) NULL else if (is.data.frame(mgr$topics))
+    tibble::as_tibble(mgr$topics) else
+    purrr::map(mgr$topics, ~ tibble(topic = .x$topic, label = .x$label)) |>
       purrr::list_rbind()
-    if (setequal(renamed$topic, drafts$topic)) {
-      drafts |> dplyr::left_join(renamed, by = "topic") |>
-        dplyr::mutate(label = dplyr::coalesce(label_new, label)) |>
-        dplyr::select(-label_new)
-    } else drafts
+  mgr_ok <- !is.null(mgr_tbl) && nrow(mgr_tbl) == nrow(drafts) &&
+    setequal(as.integer(mgr_tbl$topic), drafts$topic)
+  mgr_status <- if (is.null(mgr_tbl)) "no response; blind drafts kept" else
+    if (!mgr_ok) glue::glue("rejected: returned {nrow(mgr_tbl)} labels for \\
+      {nrow(drafts)} topics, or different topic numbers; blind drafts kept") else
+    "applied"
+  final <- if (mgr_ok) {
+    drafts |>
+      dplyr::left_join(dplyr::transmute(mgr_tbl, topic = as.integer(topic),
+                                        label_new = label), by = "topic") |>
+      dplyr::mutate(label = dplyr::coalesce(label_new, label)) |>
+      dplyr::select(-label_new)
   } else drafts
   n_renamed <- sum(final$label != drafts$label, na.rm = TRUE)
 
   codebook <- final |>
-    dplyr::mutate(proposition = NA_character_) |>   # Script 2 fills this
+    dplyr::mutate(proposition = NA_character_) |>  # 03_stance.qmd fills this
     dplyr::left_join(topic_summary |> dplyr::select(topic, prevalence, avepp),
                      by = "topic") |>
     dplyr::arrange(topic)
   readr::write_csv(codebook, cb_path)
   write_fingerprint(cb_path, theta_in)
-  writeLines(glue::glue("Codebook drafted: {nrow(codebook)} topics, \\
-                         {n_renamed} renamed by the manager. EDIT \\
-                         {basename(cb_path)} before running Script 2; it will \\
-                         not be redrafted while the file exists."))
+  writeLines(glue::glue("Codebook drafted: {nrow(codebook)} topics. Manager \\
+    pass: {mgr_status}; {n_renamed} label(s) renamed. EDIT \\
+    {basename(cb_path)} before running 03_stance.qmd; it will not be \\
+    redrafted while the file exists."))
+}
+
+# Duplicate labels are checked on every render, drafted or hand-edited: two
+# topics sharing a name are indistinguishable in every table, plot, and in the
+# dashboard, and a coder cannot tell which one a paragraph belongs to.
+dup <- codebook |>
+  dplyr::mutate(key = str_to_lower(str_squish(label))) |>
+  dplyr::group_by(key) |>
+  dplyr::filter(dplyr::n() > 1) |>
+  dplyr::ungroup()
+if (nrow(dup)) {
+  warning("Duplicate topic labels: ", str_c(unique(dup$label), collapse = "; "),
+          ". Rename them in ", basename(cb_path), ".")
+  writeLines(glue::glue("**Duplicate labels to fix:** \\
+    {str_c('topic ', dup$topic, ' (', dup$label, ')', collapse = ', ')}. \\
+    Rename them in {basename(cb_path)} using each topic's terms above."))
 }
 
 codebook |>
@@ -464,7 +491,10 @@ fitted effect object, with 95 percent intervals. Two details make the
 prediction correct rather than merely plausible. The spline basis is rebuilt at
 the prediction grid with `predict(bs, ...)`, which reuses the **original
 knots**; calling `ns()` afresh on the grid would place knots differently and
-mis-predict silently. And the intervals come from the simulation draws
+mis-predict silently. Curves can dip slightly below zero where a topic is
+nearly absent: `estimateEffect` fits a linear model to topic proportions, which
+does not respect the 0 bound, so read values below zero as zero rather than as
+an error. And the intervals come from the simulation draws
 `estimateEffect` already stores under `uncertainty = "Global"`, so they carry
 the topic-model uncertainty rather than regression standard errors alone.
 
@@ -497,6 +527,7 @@ glue::glue("Predicted prevalence for {dplyr::n_distinct(topic_trends$topic)} \\
 
 ```{r trend-plots}
 #| fig-height: 8
+#| fig-cap: "Expected topic proportion by year with 95 percent intervals, from estimateEffect. The model is linear in proportions, so stretches where a topic is nearly absent can dip below zero; read those as zero."
 # All topics, paged so panels stay legible: 25 facets on one page renders each
 # about 1.5 inches wide and the ribbons become unreadable.
 trend_panel <- function(d, page, n_pages) {

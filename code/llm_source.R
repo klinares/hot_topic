@@ -114,6 +114,16 @@ trend_curve <- function(d, outcome, cluster, df_spline = 3L) {
   dd  <- dplyr::bind_cols(d, tibble::as_tibble(bs))
   f   <- as.formula(str_c(".y ~ ", str_c(colnames(bs), collapse = " + ")))
   m   <- glm(f, data = dd, family = quasibinomial())
+  # Separation: when the outcome is perfectly predicted over part of the year
+  # range (every relevant paragraph after some year is "favor", say), the
+  # logistic coefficients diverge, fitted values pin to 0 or 1, and the
+  # interval balloons to [0, 1]. R warns about this for binomial but not for
+  # quasibinomial, so it is checked directly. A separated fit is refused
+  # rather than drawn: its curve and interval are artifacts, not estimates.
+  mu <- stats::fitted(m)
+  if (!m$converged || any(mu < 1e-8 | mu > 1 - 1e-8))
+    stop("separation: the outcome is (nearly) perfectly predicted over part ",
+         "of the year range, so no stable curve can be estimated")
   V   <- cluster_robust_vcov(m, dd[[cluster]])
   grid <- sort(unique(d$Year))
   Xg   <- cbind(1, predict(bs, newx = grid))
@@ -130,6 +140,19 @@ trend_curve <- function(d, outcome, cluster, df_spline = 3L) {
                  se_ratio = se_ratio)
 }
 
+# Minimum support before a spline trend is attempted for one class: enough
+# positives and negatives to estimate df_spline + 1 coefficients, and
+# positives spread over more distinct years than the spline has degrees of
+# freedom. Returns NULL when supported, otherwise the reason in plain words.
+class_support <- function(y, year, df_spline, min_n) {
+  if (sum(y) < min_n) return(glue::glue("{sum(y)} paragraphs (need {min_n})"))
+  if (sum(1 - y) < min_n)
+    return(glue::glue("only {sum(1 - y)} paragraphs outside the class (need {min_n})"))
+  if (dplyr::n_distinct(year[y == 1]) <= df_spline)
+    return(glue::glue("positives in only {dplyr::n_distinct(year[y == 1])} years"))
+  NULL
+}
+
 # Recovery curve: how many paragraphs would have sufficed? Subsamples the
 # census at increasing sizes, refits the trend, and measures the mean absolute
 # deviation from the full-census curve. Costs no API calls, because every
@@ -144,7 +167,11 @@ recovery_curve <- function(d, outcome, sizes, reps, df_spline = 3L, seed = 1L) {
       per <- max(1, round(n / (nrow(d) / length(cl))))
       sub <- d |> dplyr::filter(atom_id %in% sample(cl, min(per, length(cl))))
       if (dplyr::n_distinct(sub$Year) < df_spline + 1) return(NULL)
-      cur <- trend_curve(sub, outcome, "atom_id", df_spline)
+      # Small subsamples often separate even when the census does not; such a
+      # replicate is skipped, and the count of usable replicates is reported.
+      cur <- tryCatch(trend_curve(sub, outcome, "atom_id", df_spline),
+                      error = function(e) NULL)
+      if (is.null(cur)) return(NULL)
       tibble::tibble(n_target = n, rep = r, n_actual = nrow(sub),
                      mad = mean(abs(cur$fit - full$fit[match(cur$Year,
                                                              full$Year)])))
