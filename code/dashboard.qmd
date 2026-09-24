@@ -1,0 +1,106 @@
+---
+title: "Topic dashboard"
+subtitle: "Script 4 of 4: build the standalone HTML dashboard"
+format:
+  typst:
+    toc: false
+execute:
+  warning: false
+  message: false
+---
+
+```{=typst}
+#show figure: set block(breakable: true)
+```
+
+```{=html}
+<!--
+RUN ORDER (script 4 of 4; render any time after 02_topics.qmd)
+  Rebuilds outputs/topic_dashboard.html from what scripts 2 and 3 wrote.
+  It makes no API calls and fits nothing, so it takes seconds; rerun it
+  after each 03_stance.qmd topic to add that topic's stance labels.
+  The PDF this renders is only a build record. The HTML is the product.
+-->
+```
+
+```{r config}
+db <- list(
+  title = "Topic dashboard",  # heading shown at the top of the page
+  stance_rater = "stance_1"  # which rater's labels the dashboard shows
+)
+
+suppressPackageStartupMessages({
+  library(here)
+  library(tidyverse)  # tidyverse LAST so its verbs win
+})
+# Used namespaced: jsonlite, glue.
+options(knitr.table.max.print = Inf, knitr.kable.max_rows = Inf)
+`%||%` <- function(x, y) if (is.null(x)) y else x
+p_out <- function(f) here::here("outputs", f)
+source(here::here("code", "llm_source.R"))
+```
+
+# Inputs
+
+The dashboard is built only from files already on disk. Each is required except the stance files, which appear one per topic as `03_stance.qmd` is run. The codebook is checked against the topic proportions it was drafted from: if `02_topics.qmd` has refit since, topics may be renumbered, and a stale codebook would put its labels on the wrong topics. The render stops rather than publish that.
+
+```{r inputs}
+#| results: asis
+needed <- p_out(c("paragraph_theta.csv", "topic_codebook.csv",
+                  "topic_summary.csv", "topic_trends.csv"))
+invisible(fingerprint(needed))  # stops by name if any input is missing
+check_fingerprint(p_out("topic_codebook.csv"), p_out("paragraph_theta.csv"),
+                  strict = FALSE)
+
+paragraph_theta <- readr::read_csv(needed[1], show_col_types = FALSE)
+codebook <- readr::read_csv(needed[2], show_col_types = FALSE) |>
+  dplyr::left_join(
+    readr::read_csv(needed[3], show_col_types = FALSE) |>
+      dplyr::select(topic, frex),
+    by = "topic")
+trends <- readr::read_csv(needed[4], show_col_types = FALSE)
+
+stance_files <- list.files(here::here("outputs"),
+                           pattern = "^stance_labels_topic\\d+\\.csv$",
+                           full.names = TRUE)
+stance_all <- stance_files |>
+  purrr::map(readr::read_csv, show_col_types = FALSE) |>
+  purrr::list_rbind()
+stance <- if (nrow(stance_all) == 0) NULL else {
+  s <- stance_all |> dplyr::filter(rater == db$stance_rater, !is.na(label))
+  purrr::set_names(s$label, s$para_uid)
+}
+
+writeLines(glue::glue("{nrow(paragraph_theta)} paragraphs, {nrow(codebook)} \\
+  topics, trends for {dplyr::n_distinct(trends$topic)} topics, stance labels \\
+  from {length(stance_files)} topic file(s)."))
+```
+
+# Build
+
+```{r build}
+#| results: asis
+out <- p_out("topic_dashboard.html")
+write_dashboard(
+  path = out,
+  template = here::here("code", "dashboard_template.html"),
+  paragraph_theta = paragraph_theta,
+  codebook = codebook,
+  trends = trends,
+  stance = stance,
+  title = db$title)
+
+tibble::tibble(
+  item = c("file", "size (MB)", "topics", "paragraphs", "documents",
+           "topics with a proposition", "paragraphs with a stance label",
+           "built"),
+  value = c(basename(out), round(file.size(out) / 1e6, 2), nrow(codebook),
+            nrow(paragraph_theta), dplyr::n_distinct(paragraph_theta$atom_id),
+            sum(!is.na(codebook$proposition)), length(stance),
+            format(Sys.time(), "%Y-%m-%d %H:%M"))) |>
+  tbl_paged(caption = "Dashboard build record.")
+```
+
+# Before sharing it
+
+The dashboard is one self-contained file: it opens in any browser, from disk or a web host, with no server and no internet connection. **It embeds the full text of every document**, so publishing it republishes the corpus; confirm that is acceptable for this corpus before posting it anywhere public. The prevalence chart is a model estimate with an interval and the yearly counts are exact, and the page labels them as the different claims they are.

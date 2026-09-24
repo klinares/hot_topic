@@ -1,0 +1,530 @@
+---
+title: "Topic model and topic codebook"
+subtitle: "Script 2 of 3: STM, modal assignment, prevalence trends, labels"
+format:
+  typst:
+    toc: false
+    fig-width: 9
+    fig-height: 5.5
+execute:
+  warning: false
+  message: false
+---
+
+```{=typst}
+#show figure: set block(breakable: true)
+```
+
+```{=html}
+<!--
+RUN ORDER (script 2 of 3; reads 01_preprocess.qmd outputs)
+  1. Render with tx$run_searchK = TRUE (hours), read the diagnostics, set
+     tx$K, flip it back.
+  2. Render with tx$run_sensitivity = TRUE once, to show the parse floor
+     does not drive the topics. Report the table.
+  3. The first render past the fit drafts topic_codebook.csv. Edit it; it is
+     never redrafted while it exists.
+Every cache here carries a fingerprint of the file it was built from. If
+script 1 is rerun and paragraphs.csv changes, this script stops by name and
+tells you what to delete, instead of reloading a stale fit.
+OUTPUTS (all in outputs/): paragraph_theta.csv, topic_summary.csv,
+topic_codebook.csv, topic_trends.csv, stm_fit.rds, stm_year_effects.rds.
+-->
+```
+
+```{r config}
+tx <- list(
+  seed = 2026L,
+  min_docfreq = 5L,  # DTM vocabulary floor
+  run_searchK = FALSE,  # TRUE for the long K-selection run
+  K_grid = seq(5, 30, 3),  # widen for a larger corpus
+  K = 12L,  # set from the searchK diagnostics
+  spline_df = 5L,
+  run_sensitivity = FALSE,  # TRUE: refit STM at other parse floors
+  sens_factors = c(0.5, 1.5),  # floor multiples tested against the baseline
+  facets_per_page = 9L,  # topic trend panels per page
+  workers = 16L,
+  use_openrouter = TRUE,  # FALSE to use the OpenAI-compatible endpoint
+  # base_url_env and api_key_env are the NAMES of .Renviron variables, so the
+  # small and large models can use different credentials and nothing
+  # sensitive appears here. Ignored when use_openrouter = TRUE.
+  steps = tibble::tribble(
+    ~step, ~base_url_env, ~api_key_env, ~model,
+    "label", "COMPASS_SMALL_URL", "COMPASS_SMALL_KEY", "MODEL-FOR-LABELING",
+    "manager", "COMPASS_LARGE_URL", "COMPASS_LARGE_KEY", "MODEL-FOR-MANAGER")
+)
+
+suppressPackageStartupMessages({
+  library(here); library(stm); library(quanteda); library(tidytext)
+  library(splines); library(furrr); library(viridis)
+  library(tidyverse)  # tidyverse LAST so its verbs win
+})
+# Used namespaced: clue (Hungarian matching), ellmer, glue.
+theme_set(theme_minimal(base_size = 12))
+options(knitr.table.max.print = Inf, knitr.kable.max_rows = Inf,
+        max.print = 1e6)
+set.seed(tx$seed)
+`%||%` <- function(x, y) if (is.null(x)) y else x
+p_out <- function(f) here::here("outputs", f)
+source(here::here("code", "llm_source.R"))
+if (isTRUE(tx$use_openrouter)) {
+  source(here::here("code", "llm_openrouter.R"))
+  tx$steps$model <- open_router_models[tx$steps$step]
+}
+```
+
+# Input
+
+The corpus is the paragraph units from `01_preprocess.qmd`. Every cache below is fingerprinted against this file, so a changed parse cannot silently meet an old fit.
+
+```{r input}
+#| results: asis
+para_in <- p_out("paragraphs.csv")
+sens_in <- p_out(c("paragraphs.csv", "blocks.csv", "linkage_plan.rds",
+                   "block_embeddings.rds"))
+invisible(fingerprint(para_in))  # stops by name if script 1 has not been rendered
+paragraphs <- readr::read_csv(para_in, show_col_types = FALSE)
+stopifnot("paragraphs.csv must carry the script 1 columns" =
+            all(c("para_uid", "atom_id", "para_id", "Year", "n_tokens",
+                  "text") %in% names(paragraphs)))
+writeLines(glue::glue("{nrow(paragraphs)} paragraph units from \\
+  {dplyr::n_distinct(paragraphs$atom_id)} documents."))
+```
+
+# Tokenization
+
+The DTM is built from cleaned tokens. Embeddings in script 1 used the raw text; this cleaning affects topics only.
+
+```{r tokens}
+# DTM cleaning (embeddings used the raw text; this affects topics only).
+# Tokens must be purely alphabetic, which drops numbers, dates written in
+# digits, and anything with special characters. Month and weekday names are
+# stopped too: temporal words let topics encode Year directly, which would
+# leak time into the prevalence model used to estimate trends over time.
+temporal <- tibble(word = str_to_lower(c(month.name, month.abb,
+  "monday", "tuesday", "wednesday", "thursday", "friday", "saturday",
+  "sunday")))
+tokens <- paragraphs |>
+  dplyr::select(para_uid, text) |>
+  tidytext::unnest_tokens(word, text) |>
+  dplyr::mutate(word = str_remove_all(word, "'")) |>
+  dplyr::filter(str_detect(word, "^[a-z]{2,}$")) |>
+  dplyr::anti_join(tidytext::get_stopwords(), by = "word") |>
+  dplyr::anti_join(temporal, by = "word")
+```
+
+# Document-term matrix
+
+Rare terms (under `r tx$min_docfreq` paragraphs) are trimmed to stabilize estimation. `meta` is built from the surviving dfm rownames, so alignment with the model survives any dropped document. At work, check `nfeat(dfm_para)`: a vocabulary in the low thousands is comfortable at this scale, and a much larger one argues for a higher floor.
+
+```{r dtm}
+dfm_para <- tokens |>
+  dplyr::count(para_uid, word) |>
+  tidytext::cast_dfm(para_uid, word, n) |>
+  quanteda::dfm_trim(min_docfreq = tx$min_docfreq)
+stm_in <- quanteda::convert(dfm_para, to = "stm")
+# as.data.frame, not a tibble: stm subsets metadata with base [ , ] semantics
+# when building the prevalence model matrix, and a tibble returns a column
+# rather than a vector there ("Error creating model matrix").
+meta   <- tibble(para_uid = rownames(dfm_para)) |>
+  dplyr::left_join(dplyr::select(paragraphs, para_uid, atom_id, para_id, Year,
+                                 n_tokens, text), by = "para_uid") |>
+  as.data.frame()
+stopifnot("every dfm row must match a paragraph" = !anyNA(meta$Year),
+          "meta must align with the stm documents" =
+            nrow(meta) == length(stm_in$documents))
+
+# Spline basis as ORDINARY COLUMNS, so no function call ever appears inside a
+# formula. stm builds its prevalence model matrix by evaluating the formula
+# against the metadata, and a call there (s(), ns(), or anything namespaced)
+# is the documented cause of "Error creating model matrix". prev_form then
+# reads ~ yr1 + yr2 + ..., which is also what estimateEffect uses below.
+bs <- splines::ns(meta$Year, df = tx$spline_df)
+colnames(bs) <- str_c("yr", seq_len(ncol(bs)))
+meta <- cbind(meta, as.data.frame(bs))
+prev_rhs  <- str_c(colnames(bs), collapse = " + ")   # "yr1 + yr2 + ..."
+prev_form <- as.formula(str_c("~ ", prev_rhs))
+```
+
+# Choosing K
+
+stm's own parallelism forks, which is unavailable on Windows, so the held-out grid is parallelized explicitly with furrr. Read the panels together: take the smallest K where held-out likelihood has flattened and residual dispersion has stopped falling, then break ties on the coherence-exclusivity frontier. If the frontier is still improving at the top of the grid, widen `tx$K_grid` rather than extrapolating. Semantic coherence is $\sum_{i<j}\log\{(D(v_i,v_j)+1)/D(v_i)\}$ over each topic's top words, with the denominator the higher-ranked word.
+
+```{r searchK}
+if (isTRUE(tx$run_searchK)) {
+  future::plan(future::multisession, workers = tx$workers)
+  ho <- stm::make.heldout(stm_in$documents, stm_in$vocab, seed = tx$seed)
+  metrics <- cache_guarded(p_out("searchK_metrics.csv"), para_in, {
+    furrr::future_map(tx$K_grid, function(k) {
+      fit <- stm::stm(ho$documents, ho$vocab, K = k, init.type = "Spectral",
+                      prevalence = prev_form, data = meta, verbose = FALSE)
+      tibble(K = k,
+             heldout   = stm::eval.heldout(fit, ho$missing)$expected.heldout,
+             dispersion = stm::checkResiduals(fit, ho$documents)$dispersion,
+             coherence = mean(stm::semanticCoherence(fit, ho$documents)),
+             exclusivity = mean(stm::exclusivity(fit)))
+    }, .options = furrr::furrr_options(seed = tx$seed)) |> purrr::list_rbind()
+  })
+  future::plan(future::sequential)
+  metrics |>
+    tidyr::pivot_longer(-K) |>
+    ggplot(aes(K, value)) + geom_line(color = viridis(1, begin = 0.35)) +
+    geom_point() + facet_wrap(~ name, scales = "free_y") + labs(y = NULL)
+} else {
+  if (is.null(tx$K))
+    stop("tx$K is NULL and tx$run_searchK is FALSE. Re-run the config chunk, ",
+         "or set tx$K before continuing.")
+  glue::glue("searchK skipped (tx$run_searchK = FALSE); K fixed at {tx$K}")
+}
+```
+
+# Structural topic model
+
+Year enters the prevalence model as a spline (df `r tx$spline_df`), so topic attention is allowed to drift over the period instead of being averaged away; spectral initialization is deterministic given the data, removing initialization luck from a fit everything downstream depends on.
+
+```{r stm-fit}
+stm_fit <- cache_guarded(p_out("stm_fit.rds"), para_in,
+  stm::stm(stm_in$documents, stm_in$vocab, K = tx$K, init.type = "Spectral",
+           prevalence = prev_form, data = meta, verbose = FALSE))
+
+# K comes from the FITTED model, not the config: a cached fit can predate a
+# change to tx$K, and every downstream object is sized by the fit.
+K_fit <- ncol(stm_fit$theta)
+if (K_fit != tx$K)
+  stop("Cached stm_fit.rds has K = ", K_fit, " but tx$K = ", tx$K,
+       ". Delete outputs/stm_fit.rds (and stm_year_effects.rds, ",
+       "topic_trends.csv) once, then re-render.")
+
+theta <- stm_fit$theta
+colnames(theta) <- str_c("topic_", seq_len(K_fit))
+paragraph_theta <- meta |> dplyr::bind_cols(tibble::as_tibble(theta))
+```
+
+# Modal topic assignment and its diagnostics
+
+Each paragraph is assigned its **modal** topic, so topics partition the corpus (mutually exclusive, collectively exhaustive) and can serve as sampling strata in Script 2. This is the same move as modal class assignment in latent class analysis, and it inherits the same caveat: a modal assignment is an estimate, not an observation, and treating it as observed pushes classification error downstream. Two LCA diagnostics report how much error to expect. **Entropy $R^2$** summarizes overall assignment sharpness on a 0-1 scale; **AvePP**, the average posterior probability among a topic's own assigned paragraphs, does it per topic, with about 0.7 the conventional floor. Unlike LCA, STM supplies no classification error matrix over modal assignment, so no BCH-style correction is available here; the honest substitutes are the `min_theta` scope floor in Script 2 and its sensitivity analysis.
+
+```{r modal}
+#| results: asis
+paragraph_theta <- paragraph_theta |>
+  dplyr::mutate(topic     = max.col(theta, ties.method = "first"),
+                theta_max = theta[cbind(dplyr::row_number(), topic)])
+
+ent <- -sum(theta * log(theta + 1e-12))
+entropy_r2 <- 1 - ent / (nrow(theta) * log(K_fit))
+
+topic_summary <- tibble(
+    topic = seq_len(K_fit),
+    prevalence = colMeans(theta),
+    frex = apply(stm::labelTopics(stm_fit, n = 8)$frex, 1, str_c,
+                 collapse = ", "),
+    prob = apply(stm::labelTopics(stm_fit, n = 8)$prob, 1, str_c,
+                 collapse = ", ")) |>
+  dplyr::left_join(
+    paragraph_theta |>
+      dplyr::group_by(topic) |>
+      dplyr::summarise(n_paras = dplyr::n(), avepp = mean(theta_max)),
+    by = "topic")
+
+readr::write_csv(topic_summary, p_out("topic_summary.csv"))
+readr::write_csv(paragraph_theta, p_out("paragraph_theta.csv"))
+theta_in <- p_out("paragraph_theta.csv")
+
+glue::glue("Entropy R2 = {round(entropy_r2, 3)}; topics with AvePP < 0.7: ",
+           "{sum(topic_summary$avepp < 0.7)} of {K_fit}")
+topic_summary |>
+  dplyr::arrange(dplyr::desc(prevalence)) |>
+  dplyr::select(topic, prevalence, n_paras, avepp) |>
+  tbl_paged(caption = "Topics by prevalence, with assigned paragraph counts and AvePP (below 0.7 means fuzzy modal assignment).")
+topic_summary |>
+  dplyr::arrange(dplyr::desc(prevalence)) |>
+  dplyr::mutate(ttl = str_c("Topic ", topic)) |>
+  tbl_records("ttl", c("frex", "prob"),
+              caption = "Topic terms: the evidence for checking each label.")
+```
+
+# Does the parse drive the topics?
+
+The floor is calibrated to the corpus, but the floor is still a decision about the document unit, and the topic model is sensitive to document length. This section tests whether that choice matters. The unparagraphed documents are relinked at `r str_c(tx$sens_factors, collapse = " and ")` times the floor calibrated in script 1, using the vectors cached there, so no API calls are made, the STM is refit at the same K on each, and every baseline topic is matched one-to-one to its best counterpart in each alternative fit by the cosine of their topic-word distributions over the shared vocabulary (Hungarian assignment via `clue::solve_LSAP`).
+
+The result is reported as similarities, not as a pass or fail, since any threshold would be invented. Read it this way: if most matched cosines are high at both alternative floors, topics are properties of the corpus and not of the parse; if a few topics match poorly, those are the ones whose existence depends on how text was grouped, and they deserve caution before being carried into stance measurement.
+
+```{r sensitivity}
+#| results: asis
+if (isTRUE(tx$run_sensitivity)) {
+  blocks <- readr::read_csv(p_out("blocks.csv"), show_col_types = FALSE)
+  plan <- readRDS(p_out("linkage_plan.rds"))
+  emb <- readRDS(p_out("block_embeddings.rds"))
+  if (!any(!plan$doc$paragraphed))
+    writeLines("No documents were relinked in script 1; the test has nothing to vary.")
+  refit <- function(f) {
+    p <- link_corpus(blocks, emb$vec, plan$floor * f, plan$doc)
+    d <- p |>
+      dplyr::select(para_uid, text) |>
+      tidytext::unnest_tokens(word, text) |>
+      dplyr::mutate(word = str_remove_all(word, "'")) |>
+      dplyr::filter(str_detect(word, "^[a-z]{2,}$")) |>
+      dplyr::anti_join(tidytext::get_stopwords(), by = "word") |>
+      dplyr::anti_join(temporal, by = "word") |>
+      dplyr::count(para_uid, word) |>
+      tidytext::cast_dfm(para_uid, word, n) |>
+      quanteda::dfm_trim(min_docfreq = tx$min_docfreq)
+    s_in <- quanteda::convert(d, to = "stm")
+    list(n_docs = length(s_in$documents),
+         fit = stm::stm(s_in$documents, s_in$vocab, K = K_fit,
+                        init.type = "Spectral", verbose = FALSE))
+  }
+  sens <- cache_guarded(p_out("sensitivity_fits.rds"), sens_in,
+                    purrr::map(tx$sens_factors, refit) |>
+                      purrr::set_names(tx$sens_factors))
+  b_ref <- beta_matrix(stm_fit)
+  sens_tbl <- purrr::imap(sens, function(x, f)
+    match_topics(b_ref, beta_matrix(x$fit)) |>
+      dplyr::mutate(floor_factor = as.numeric(f), n_docs = x$n_docs)) |>
+    purrr::list_rbind()
+  readr::write_csv(sens_tbl, p_out("parse_sensitivity.csv"))
+
+  sens_tbl |>
+    dplyr::group_by(floor_factor) |>
+    dplyr::summarise(documents = dplyr::first(n_docs),
+                     median_cosine = stats::median(cosine),
+                     lowest_cosine = min(cosine),
+                     shared_vocab = dplyr::first(shared_vocab),
+                     .groups = "drop") |>
+    tbl_paged(caption = "Topic stability across parse floors: matched topic-word cosine against the baseline fit.")
+  sens_tbl |>
+    tidyr::pivot_wider(id_cols = topic, names_from = floor_factor,
+                       values_from = cosine, names_prefix = "floor_x") |>
+    dplyr::left_join(dplyr::select(topic_summary, topic, prevalence),
+                     by = "topic") |>
+    dplyr::arrange(dplyr::desc(prevalence)) |>
+    tbl_paged(caption = "Per-topic matched cosine by floor multiple. Low values mark topics whose existence depends on the parse.")
+} else {
+  writeLines("Sensitivity test skipped (tx$run_sensitivity = FALSE).")
+}
+```
+
+# Topic codebook
+
+The codebook is written **once**, after the final STM, and is the naming record from here on. If `topic_codebook.csv` already exists on disk, this section reads it and makes no API calls: the file is assumed to carry your edits, and re-drafting would overwrite them. Delete the file to redraft from scratch.
+
+Two passes, deliberately shaped:
+
+**Pass 1, one call per topic** with the smaller model (`label` step). Each call sees only that topic's own evidence: its FREX terms, its highest-probability terms, and its three highest-theta paragraphs. It is blind to every other topic, to Year, and to stance. That blindness is the point: a model shown all topics at once starts fitting a narrative across them, and labels stop being traceable to the evidence a human can check them against.
+
+**Pass 2, one manager call** with the larger model (`manager` step). Blind drafting has one predictable failure: two topics can come back with near-duplicate labels even though their term distributions differ. The manager sees all K labels with their FREX terms and resolves collisions. Its mandate is deliberately narrow, stated in the prompt and enforced by the schema: it may **rename only**. It cannot merge topics, split them, change a description, or reorder anything, because the topic structure is the statistical model's output and an LLM should not be permitted to override it.
+
+The `proposition` column is written empty here. Script 2 fills it for the one topic it processes, since propositions are stance targets and you only need them for the topics you actually analyze.
+
+```{r codebook}
+#| results: asis
+cb_path <- p_out("topic_codebook.csv")
+
+# A refit can renumber topics, and a codebook written for the old fit would
+# then label the wrong topics silently. The codebook's fingerprint is taken on
+# the theta it was drafted from; your edits to the CSV itself never trip it.
+check_fingerprint(cb_path, theta_in, strict = FALSE)
+if (file.exists(cb_path)) {
+  codebook <- readr::read_csv(cb_path, show_col_types = FALSE)
+  writeLines(glue::glue("Existing codebook found ({nrow(codebook)} topics); \\
+                         no LLM calls made. Delete {basename(cb_path)} to \\
+                         redraft."))
+} else {
+  ev <- topic_summary |>
+    dplyr::left_join(
+      paragraph_theta |>
+        dplyr::group_by(topic) |>
+        dplyr::slice_max(theta_max, n = 3) |>
+        dplyr::summarise(ex = str_c(str_trunc(text, 300), collapse = "\n- "),
+                         .groups = "drop"),
+      by = "topic")
+
+  # ---- Pass 1: one blind call per topic ------------------------------------
+  label_sys <- build_prompt(
+    role = str_c("You are a survey methodologist who names statistical topics ",
+                 "so colleagues can use them."),
+    task = str_c("Read this topic's distinctive terms and example paragraphs. ",
+                 "Write a short label and one factual sentence describing what ",
+                 "these paragraphs are about. Before answering, check that ",
+                 "every word of your description is supported by the evidence ",
+                 "shown."),
+    rules = c("Use only the terms and paragraphs shown.",
+              "Do not infer stance, sentiment, intent, or who is speaking.",
+              "Do not invent statistics, dates, places, or named entities.",
+              "If the evidence is mixed, describe the mixture plainly."),
+    output = "A label of at most 4 words and a one-sentence description.")
+  label_schema <- ellmer::type_object(
+    label       = ellmer::type_string("Topic name, at most 4 words."),
+    description = ellmer::type_string("One factual sentence."))
+  label_chat <- make_chat("label", label_sys, tx$steps, tx$use_openrouter)
+
+  drafts <- purrr::map(seq_len(nrow(ev)), function(i) {
+    r <- call_one(label_chat,
+                  str_c("Distinctive (FREX) terms: ", ev$frex[i],
+                        "\nHighest-probability terms: ", ev$prob[i],
+                        "\nExample paragraphs:\n- ", ev$ex[i]), label_schema)
+    tibble(topic = ev$topic[i],
+           label = r$label %||% NA_character_,
+           description = r$description %||% NA_character_)
+  }) |> purrr::list_rbind()
+  if (anyNA(drafts$label))
+    warning(sum(is.na(drafts$label)), " topic label calls failed; those rows ",
+            "are blank in the codebook and need a name by hand.")
+
+  # ---- Pass 2: manager resolves duplicate labels, renaming ONLY -------------
+  mgr_sys <- build_prompt(
+    role = str_c("You are a senior methodologist reviewing a topic codebook ",
+                 "for clarity before it goes to coders."),
+    task = str_c("You are shown every topic's draft label with its ",
+                 "distinctive terms. Some labels are near-duplicates of each ",
+                 "other even though the topics differ. Return a label for ",
+                 "EVERY topic: unchanged where it is already distinct, and ",
+                 "revised only where two or more labels would be confused. ",
+                 "Before answering, check that no two returned labels are ",
+                 "the same and that every topic number appears exactly once."),
+    rules = c("Rename only. Never merge, split, drop, or reorder topics.",
+              "Return the same number of topics you were given.",
+              "Base any rename on the distinctive terms shown, nothing else.",
+              "Keep labels to at most 4 words.",
+              "Do not write descriptions; they are not yours to change."),
+    output = "One label per topic number.")
+  mgr_schema <- ellmer::type_object(
+    topics = ellmer::type_array(
+      items = ellmer::type_object(
+        topic = ellmer::type_integer("The topic number, unchanged."),
+        label = ellmer::type_string("Final label, at most 4 words."))))
+  mgr_prompt <- str_c(
+    "Draft labels with their distinctive terms:\n",
+    str_c("- topic ", drafts$topic, ": \"", drafts$label, "\" | terms: ",
+          ev$frex[match(drafts$topic, ev$topic)], collapse = "\n"))
+  mgr <- call_one(make_chat("manager", mgr_sys, tx$steps, tx$use_openrouter),
+                  mgr_prompt, mgr_schema)
+
+  # The manager is advisory: its output is applied ONLY if it returns exactly
+  # one label per topic with no topics invented or lost. Any deviation and the
+  # blind drafts stand, because a malformed rename must never reshape the
+  # codebook silently.
+  final <- if (!is.null(mgr) && length(mgr$topics) == nrow(drafts)) {
+    renamed <- purrr::map(mgr$topics, ~ tibble(topic = as.integer(.x$topic),
+                                               label_new = .x$label)) |>
+      purrr::list_rbind()
+    if (setequal(renamed$topic, drafts$topic)) {
+      drafts |> dplyr::left_join(renamed, by = "topic") |>
+        dplyr::mutate(label = dplyr::coalesce(label_new, label)) |>
+        dplyr::select(-label_new)
+    } else drafts
+  } else drafts
+  n_renamed <- sum(final$label != drafts$label, na.rm = TRUE)
+
+  codebook <- final |>
+    dplyr::mutate(proposition = NA_character_) |>   # Script 2 fills this
+    dplyr::left_join(topic_summary |> dplyr::select(topic, prevalence, avepp),
+                     by = "topic") |>
+    dplyr::arrange(topic)
+  readr::write_csv(codebook, cb_path)
+  write_fingerprint(cb_path, theta_in)
+  writeLines(glue::glue("Codebook drafted: {nrow(codebook)} topics, \\
+                         {n_renamed} renamed by the manager. EDIT \\
+                         {basename(cb_path)} before running Script 2; it will \\
+                         not be redrafted while the file exists."))
+}
+
+codebook |>
+  dplyr::mutate(ttl = str_c("Topic ", topic, ": ", label)) |>
+  tbl_records("ttl", "description",
+              caption = "Topic codebook. Labels drafted blind per topic, then deduplicated by a rename-only manager pass. Edit the CSV; nothing downstream redrafts it.")
+```
+
+# Representative paragraphs
+
+```{r thoughts}
+#| results: asis
+top4 <- topic_summary |> dplyr::slice_max(prevalence, n = 4) |>
+  dplyr::pull(topic)
+th <- stm::findThoughts(stm_fit, texts = meta$para_uid, n = 3, topics = top4)
+tibble(topic = rep(top4, each = 3), para_uid = unlist(th$docs)) |>
+  dplyr::left_join(paragraphs |> dplyr::select(para_uid, text),
+                   by = "para_uid") |>
+  dplyr::mutate(ttl = str_c("Topic ", topic, " | ", para_uid)) |>
+  tbl_records("ttl", "text",
+              caption = "Three highest-theta paragraphs for the four most prevalent topics.")
+```
+
+# Prevalence over time
+
+```{r effects}
+stm_year_effects <- cache_guarded(p_out("stm_year_effects.rds"), para_in,
+  stm::estimateEffect(
+    as.formula(str_c("1:", K_fit, " ~ ", prev_rhs)),
+    stm_fit, metadata = meta, uncertainty = "Global"))
+```
+
+Expected topic prevalence is predicted across the observed year range from the
+fitted effect object, with 95 percent intervals. Two details make the
+prediction correct rather than merely plausible. The spline basis is rebuilt at
+the prediction grid with `predict(bs, ...)`, which reuses the **original
+knots**; calling `ns()` afresh on the grid would place knots differently and
+mis-predict silently. And the intervals come from the simulation draws
+`estimateEffect` already stores under `uncertainty = "Global"`, so they carry
+the topic-model uncertainty rather than regression standard errors alone.
+
+```{r trend-estimates}
+# Prediction grid: every observed year, with the basis evaluated at the
+# ORIGINAL knots so the fitted coefficients apply.
+grid <- tibble(Year = sort(unique(meta$Year)))
+Xg   <- cbind(1, predict(bs, newx = grid$Year))
+
+# estimateEffect stores per-topic simulation draws of the coefficient vector
+# in $parameters[[k]][[j]]$est. Predicting each draw and taking quantiles
+# propagates both the regression and the topic-model uncertainty.
+draws_for_topic <- function(k) {
+  purrr::map(stm_year_effects$parameters[[k]], function(sim)
+    as.numeric(Xg %*% sim$est)) |>
+    purrr::reduce(rbind) |> matrix(ncol = nrow(grid))
+}
+topic_trends <- purrr::map(seq_along(stm_year_effects$topics), function(i) {
+  d <- draws_for_topic(i)
+  grid |> dplyr::mutate(
+    topic = stm_year_effects$topics[i],
+    fit   = apply(d, 2, mean),
+    lo    = apply(d, 2, quantile, 0.025),
+    hi    = apply(d, 2, quantile, 0.975))
+}) |> purrr::list_rbind()
+readr::write_csv(topic_trends, p_out("topic_trends.csv"))
+glue::glue("Predicted prevalence for {dplyr::n_distinct(topic_trends$topic)} \\
+            topics across {nrow(grid)} years written to topic_trends.csv")
+```
+
+```{r trend-plots}
+#| fig-height: 8
+# All topics, paged so panels stay legible: 25 facets on one page renders each
+# about 1.5 inches wide and the ribbons become unreadable.
+trend_panel <- function(d, page, n_pages) {
+  ggplot(d, aes(Year, fit)) +
+    geom_ribbon(aes(ymin = lo, ymax = hi), alpha = 0.2,
+                fill = viridis(1, begin = 0.35)) +
+    geom_line(linewidth = 0.7, color = viridis(1, begin = 0.35)) +
+    facet_wrap(~ topic_label, scales = "free_y", ncol = 3) +
+    labs(x = NULL, y = "expected topic proportion",
+         title = glue::glue("Topic prevalence over time ({page} of {n_pages})"),
+         subtitle = "Model-based estimates with 95 percent intervals")
+}
+trend_pages <- topic_trends |>
+  dplyr::left_join(topic_summary |> dplyr::select(topic, prevalence),
+                   by = "topic") |>
+  dplyr::left_join(codebook |> dplyr::select(topic, label), by = "topic") |>
+  dplyr::mutate(
+    topic_label = str_c("T", topic, ": ", str_trunc(label, 22)),
+    page = (dplyr::dense_rank(dplyr::desc(prevalence)) - 1L) %/%
+             tx$facets_per_page + 1L) |>
+  dplyr::group_split(page)
+purrr::iwalk(trend_pages, function(d, i)
+  print(trend_panel(d, i, length(trend_pages))))
+```
+
+```{r handoff}
+glue::glue("outputs/ written: paragraphs.csv, paragraph_theta.csv (ids, Year, \\
+n_tokens, text, topic_1..K, topic, theta_max), topic_summary.csv, \\
+topic_codebook.csv (labels; 03_stance.qmd adds propositions), topic_trends.csv, \
+stm_fit.rds, stm_year_effects.rds. 03_stance.qmd reads these.")
+```
