@@ -1,6 +1,6 @@
 ---
 title: "Preprocessing: documents to paragraph units"
-subtitle: "Script 1 of 3: validation, paragraph linkage, handoff"
+subtitle: "Script 1 of 4: validation, paragraph linkage, handoff"
 format:
   typst:
     toc: false
@@ -17,13 +17,13 @@ execute:
 
 ```{=html}
 <!--
-RUN ORDER (script 1 of 3; then 02_topics.qmd, then 03_stance.qmd)
+RUN ORDER (script 1 of 4; then 02_topics.qmd, 03_stance.qmd, 04_dashboard.qmd)
   1. Replace the Corpus chunk with your own read:
        corpus_raw <- readr::read_csv(here("input", "YOUR_FILE.csv"))
      Required columns: atom_id (document id), Year (integer), body_english.
   2. Set the embed row of tx$steps. The first render embeds every
-     unparagraphed document, one request each, sleeping at each quota
-     window. Vectors are cached in block_embeddings.rds and never re-sent;
+     unparagraphed document, one request each, window_n requests in
+     parallel then a window_wait rest. Vectors are cached in block_embeddings.rds and never re-sent;
      changing the embedding model means deleting that file.
   3. Read the linkage diagnostics. Scripts 2 and 3 carry fingerprints of
      paragraphs.csv, so if this script's output changes they stop by name
@@ -38,8 +38,9 @@ block_embeddings.rds.
 tx <- list(
   seed = 2026L,
   min_anchor = 30L,  # author paragraphs needed to anchor the target length
-  window_n = 300L,  # embedding requests per quota window (one per document)
-  window_wait = 4L * 60L * 60L,  # seconds to sleep at the window boundary
+  window_n = 300L,  # requests sent in parallel per window (limit is 500/min)
+  window_wait = 60L,  # seconds to rest between windows
+  max_active = 300L,  # simultaneous connections; lower if the gateway refuses
   use_openrouter = TRUE,  # FALSE to use the OpenAI-compatible endpoint
   # base_url_env and api_key_env are the NAMES of .Renviron variables, so
   # nothing sensitive appears here. Ignored when use_openrouter = TRUE.
@@ -52,7 +53,7 @@ suppressPackageStartupMessages({
   library(here); library(viridis)
   library(tidyverse)  # tidyverse LAST so its verbs win
 })
-# Used namespaced: ragnar (embeddings), glue, quanteda (default corpus only).
+# Used namespaced: httr2 (embeddings), glue, quanteda (default corpus only).
 theme_set(theme_minimal(base_size = 12))
 options(knitr.table.max.print = Inf, knitr.kable.max_rows = Inf,
         max.print = 1e6)
@@ -111,7 +112,7 @@ glue::glue("Validation: kept {nrow(corpus_raw)} of {n0} comments, ",
 
 Documents rarely arrive with clean paragraphs. Some authors write real paragraphs; others put a blank line after every sentence, and splitting on blank lines then yields orphan sentences too short for a topic model, which is where the STM falls apart. This section rebuilds units of a defensible length without assuming either convention and without a hand-picked size.
 
-**Blocks** are the text between newline runs. **Which documents need linkage** is decided per document: a document is *unparagraphed* when its median block is a single sentence, meaning the author broke after nearly every sentence. Paragraphed documents pass through untouched, because their blocks already are the author's paragraphs. That rule has no tuned threshold.
+**Blocks** are the text between newline runs. Hard-wrapped text (a line break every few words) is repaired first: a line that follows a line without terminal punctuation and starts with a lowercase letter is a fragment of the same sentence and is joined back. The rule is conservative on purpose; a wrap before a capitalized word is left to the embedding linkage. **Which documents need linkage** is decided per document: a document is *unparagraphed* when its median block is a single sentence, meaning the author broke after nearly every sentence. Paragraphed documents pass through untouched, because their blocks already are the author's paragraphs. That rule has no tuned threshold.
 
 **The target length comes from the corpus.** It is the median length of all paragraphs in the paragraphed documents: how long this corpus's authors make a paragraph when they do make one. If fewer than `r tx$min_anchor` such paragraphs exist, the render stops by name rather than falling back to an arbitrary number; that guard protects the stability of the median and is not a tuning knob.
 
@@ -119,11 +120,15 @@ Documents rarely arrive with clean paragraphs. Some authors write real paragraph
 
 **The floor is calibrated, not chosen.** Because merging stops once a unit reaches the floor, linked units land between one and two floors, so the output median sits above the floor. The floor is therefore found by search: the value at which the median length of relinked units matches the target. The whole method reduces to one statement a reader can check: *unparagraphed documents were relinked into units whose median length matches the median length of author-formed paragraphs in the same corpus.*
 
-**Similarity is cosine on embeddings** of the raw block text. Only unparagraphed documents are embedded, one request per document, and vectors are cached so nothing is sent twice. After a merge, the unit's vector is the token-weighted mean of its parts, an approximation to re-embedding the merged text adopted because it costs no extra requests. Calibration and the sensitivity test reuse the cached vectors, so neither makes an API call.
+**Similarity is cosine on embeddings** of the raw block text. Only unparagraphed documents are embedded, one request per document, sent `r tx$window_n` at a time in parallel with a `r tx$window_wait`-second rest between windows, and vectors are cached so nothing is sent twice. After a merge, the unit's vector is the token-weighted mean of its parts, an approximation to re-embedding the merged text adopted because it costs no extra requests. Calibration and the sensitivity test reuse the cached vectors, so neither makes an API call.
 
 ```{r blocks}
 #| results: asis
 blocks <- split_blocks(corpus_raw)
+attr(blocks, "rejoin") |>
+  tidyr::pivot_longer(dplyr::everything(), names_to = "measure") |>
+  dplyr::mutate(value = round(value, 3)) |>
+  tbl_paged(caption = "Line-break repair. share_no_end_punct is the share of raw lines that end without terminal punctuation; high values with a short median mean hard-wrapped text. fragments_joined lines were rejoined to the line before them.")
 plan <- plan_linkage(blocks, tx$min_anchor)
 n_unpar <- sum(!plan$doc$paragraphed)
 writeLines(glue::glue("{nrow(blocks)} blocks from {nrow(plan$doc)} documents. \\
@@ -132,16 +137,16 @@ writeLines(glue::glue("{nrow(blocks)} blocks from {nrow(plan$doc)} documents. \\
   {plan$target} tokens (median of {plan$n_anchor} author paragraphs; \\
   interquartile range {plan$quartiles[1]} to {plan$quartiles[2]})."))
 writeLines(glue::glue("Embedding requests needed: {n_unpar} (one per \\
-  unparagraphed document), about {ceiling(n_unpar / tx$window_n)} quota \\
-  window(s)."))
+  unparagraphed document), {ceiling(n_unpar / tx$window_n)} window(s), about \\
+  {ceiling(n_unpar / tx$window_n) - 1} minute(s) of rest."))
 ```
 
 ```{r embed}
 unpar_blocks <- blocks |>
   dplyr::semi_join(dplyr::filter(plan$doc, !paragraphed), by = "atom_id")
 emb <- if (nrow(unpar_blocks) == 0) list(vec = list()) else
-  embed_census(unpar_blocks, p_out("block_embeddings.rds"), tx$steps, tx$use_openrouter,
-               tx$window_n, tx$window_wait)
+  embed_census(unpar_blocks, p_out("block_embeddings.rds"), tx$steps,
+               tx$use_openrouter, tx$window_n, tx$window_wait, tx$max_active)
 ```
 
 ```{r link}

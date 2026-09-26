@@ -15,14 +15,11 @@ make_chat_home <- function(model, system_prompt) {
     echo = "none")
 }
 
-# Embeddings through OpenRouter's OpenAI-compatible endpoint.
-embed_home <- function(txt, model) {
-  ragnar::embed_openai(txt, model = sub("^openrouter/", "", model),
-                       base_url = "https://openrouter.ai/api/v1",
-                       api_key = Sys.getenv("OPENROUTER_API_KEY"),
-                       user = NULL,  # ragnar sends a "user" field by default;
-                                     # Mistral's API rejects it (HTTP 422)
-                       batch_size = 10000L)
+# Embedding endpoint through OpenRouter's OpenAI-compatible route.
+embed_endpoint_home <- function(model) {
+  list(url = "https://openrouter.ai/api/v1",
+       key = Sys.getenv("OPENROUTER_API_KEY"),
+       model = sub("^openrouter/", "", unname(model)))
 }
 
 # Model per pipeline step. When use_openrouter = TRUE, these replace the model

@@ -298,21 +298,41 @@ tbl_records <- function(df, title_col, body_cols, caption = NULL) {
 # the minimum measure of size is met, with semantic similarity choosing which
 # neighbor. Contiguity is never broken, so reading order survives.
 
+# Hard-wrapped text (a line break every few words) splits one sentence into
+# several blocks. A block is a FRAGMENT when the block before it ends without
+# terminal punctuation and it starts with a lowercase letter; fragments are
+# joined back to that block before anything else runs. The rule is deliberately
+# conservative: a wrap before a capitalized word ("I", a name) is left for the
+# embedding linkage to repair, and headings, which are followed by capitalized
+# text, are never absorbed here.
 split_blocks <- function(corpus) {
-  corpus |>
+  raw <- corpus |>
     dplyr::mutate(block = str_split(body_english, "\\r?\\n+")) |>
     dplyr::select(atom_id, Year, block) |>
     tidyr::unnest(block) |>
     dplyr::mutate(block = str_squish(block)) |>
-    dplyr::filter(block != "") |>
+    dplyr::filter(block != "")
+  out <- raw |>
     dplyr::group_by(atom_id) |>
-    dplyr::mutate(block_id = dplyr::row_number()) |>
-    dplyr::ungroup() |>
+    dplyr::mutate(fragment = !str_detect(dplyr::lag(block, default = "."),
+                                         "[.!?:;][\"')\\]]*$") &
+                    str_detect(block, "^[a-z]"),
+                  block_id = cumsum(!fragment)) |>
+    dplyr::group_by(atom_id, Year, block_id) |>
+    dplyr::summarise(block = str_c(block, collapse = " "),
+                     n_lines = dplyr::n(), .groups = "drop") |>
     dplyr::mutate(n_tokens = str_count(block, "\\S+"),
                   # sentence-ending punctuation followed by space or end;
                   # a heuristic (abbreviations can overcount), used only to
                   # find author-formed multi-sentence paragraphs
                   n_sent = pmax(1L, str_count(block, "[.!?]+(\\s|$)")))
+  attr(out, "rejoin") <- tibble::tibble(
+    lines_in = nrow(raw), blocks_out = nrow(out),
+    fragments_joined = nrow(raw) - nrow(out),
+    median_chars_in = stats::median(nchar(raw$block)),
+    median_chars_out = stats::median(nchar(out$block)),
+    share_no_end_punct = mean(!str_detect(raw$block, "[.!?:;][\"')\\]]*$")))
+  out
 }
 
 # Which documents need linkage, and what length to aim for. A document is
@@ -337,55 +357,89 @@ plan_linkage <- function(blocks, min_anchor) {
                                                             c(.25, .75)))
 }
 
-# Embedding provider: ragnar::embed_openai() speaks the OpenAI embeddings
-# format, which both OpenRouter and OpenAI-compatible gateways serve. batch_size
-# is set above any comment's block count, so ONE comment is ONE request.
-embed_texts <- function(txt, cfg_steps, home = FALSE) {
+# Embedding endpoint for the embed step: URL, key, and model. The OpenAI
+# embeddings format is served by OpenRouter and by OpenAI-compatible gateways.
+embed_endpoint <- function(cfg_steps, home = FALSE) {
   cfg <- cfg_steps[cfg_steps$step == "embed", ]
   if (nrow(cfg) != 1) stop("No unique 'embed' row in the steps table.")
-  if (isTRUE(home)) return(embed_home(txt, cfg$model))
+  if (isTRUE(home)) return(embed_endpoint_home(cfg$model))
   url <- Sys.getenv(cfg$base_url_env); key <- Sys.getenv(cfg$api_key_env)
   if (!nzchar(url) || !nzchar(key))
     stop("Set ", cfg$base_url_env, " and ", cfg$api_key_env, " in .Renviron.")
-  # user = NULL: ragnar sends a "user" field by default, which strict
-  # OpenAI-compatible providers reject (Mistral returns HTTP 422). ragnar adds
-  # the field with data$user <- user, so NULL leaves it out entirely.
-  ragnar::embed_openai(txt, model = cfg$model, base_url = url, api_key = key,
-                       user = NULL, batch_size = 10000L)
+  list(url = url, key = key, model = unname(cfg$model))
 }
 
-# Embed every comment's blocks, one request per comment, sleeping at each
-# quota window. The cache is a list keyed by atom_id and is saved after every
-# window, so an interrupted run resumes without re-sending anything.
+# One document's blocks as one request. Only model and input are sent, so
+# strict providers that reject extra fields (Mistral, HTTP 422) accept it.
+# Transient failures (429, 503) are retried with backoff; any other HTTP
+# error carries the provider's own message.
+embed_request <- function(txt, ep) {
+  httr2::request(ep$url) |>
+    httr2::req_url_path_append("embeddings") |>
+    httr2::req_auth_bearer_token(ep$key) |>
+    httr2::req_body_json(list(model = ep$model, input = as.list(txt))) |>
+    httr2::req_retry(max_tries = 3) |>
+    httr2::req_error(body = function(resp)
+      if (httr2::resp_has_body(resp)) httr2::resp_body_string(resp))
+}
+
+# Response to a matrix, one row per block in input order.
+embed_parse <- function(resp) {
+  d <- httr2::resp_body_json(resp)$data
+  d <- d[order(purrr::map_int(d, "index"))]
+  do.call(rbind, purrr::map(d, function(x) unlist(x$embedding)))
+}
+
+# Embed every comment's blocks, one request per comment. Each window sends up
+# to window_n requests in parallel, then rests window_wait seconds, so no
+# minute ever sees more than window_n calls (set window_n below the provider's
+# per-minute limit). The cache is a list keyed by atom_id and is saved after
+# every window, so an interrupted run resumes without re-sending anything.
 embed_census <- function(blocks, cache_path, cfg_steps, home, window_n,
-                         window_wait) {
+                         window_wait, max_active = window_n) {
+  ep <- embed_endpoint(cfg_steps, home)
   model <- unname(cfg_steps$model[cfg_steps$step == "embed"])
   cache <- if (file.exists(cache_path)) readRDS(cache_path) else
     list(model = model, vec = list(), errors = character())
   if (!identical(unname(cache$model), model))
     stop("Embedding cache was built with model '", cache$model, "'. Delete ",
          basename(cache_path), " to re-embed with the configured model.")
+  # A cached vector is reused only if its row count still matches the
+  # document's blocks; a changed parse re-sends that document.
+  n_blk <- table(blocks$atom_id)
+  stale <- names(cache$vec)[purrr::map_lgl(names(cache$vec), function(id)
+    id %in% names(n_blk) && nrow(cache$vec[[id]]) != n_blk[[id]])]
+  cache$vec[stale] <- NULL
   todo <- setdiff(unique(blocks$atom_id), names(cache$vec))
-  run_window <- function(ids, cache) {
+  n_win <- ceiling(length(todo) / window_n)
+  run_window <- function(ids, cache, w) {
     if (length(ids) == 0) return(cache)
     take <- utils::head(ids, window_n)
-    res <- purrr::map(take, function(id)
-      tryCatch(embed_texts(blocks$block[blocks$atom_id == id], cfg_steps,
-                           home), error = function(e) conditionMessage(e))) |>
+    message(glue::glue("window {w} of {n_win}: sending {length(take)} requests"))
+    reqs <- purrr::map(take, function(id)
+      embed_request(blocks$block[blocks$atom_id == id], ep))
+    resps <- httr2::req_perform_parallel(reqs, on_error = "continue",
+                                         max_active = max_active,
+                                         progress = TRUE)
+    res <- purrr::map(resps, function(r)
+      if (inherits(r, "httr2_response"))
+        tryCatch(embed_parse(r), error = function(e) conditionMessage(e))
+      else conditionMessage(r)) |>
       purrr::set_names(take)
     ok <- purrr::map_lgl(res, is.matrix)
     cache$vec <- c(cache$vec, res[ok])
     cache$errors <- c(cache$errors[setdiff(names(cache$errors), take[ok])],
                       unlist(res[!ok]))
     saveRDS(cache, cache_path)
+    message(glue::glue("window {w}: {sum(ok)} ok, {sum(!ok)} failed; ",
+                       "{length(cache$vec)} documents cached"))
     rest <- setdiff(ids, take)
     if (length(rest) == 0) return(cache)
-    message(glue::glue("embedded {length(cache$vec)} comments; sleeping ",
-                       "{window_wait}s for the quota window"))
-    Sys.sleep(window_wait)
-    run_window(rest, cache)
+    purrr::walk(seq_len(window_wait), function(s) Sys.sleep(1),
+                .progress = glue::glue("resting {window_wait}s"))
+    run_window(rest, cache, w + 1L)
   }
-  cache <- run_window(todo, cache)
+  cache <- run_window(todo, cache, 1L)
   # Failures are never dropped silently: a document without a vector cannot
   # be linked, and quietly omitting it would remove it from the corpus.
   missing <- setdiff(unique(blocks$atom_id), names(cache$vec))
@@ -393,8 +447,8 @@ embed_census <- function(blocks, cache_path, cfg_steps, home, window_n,
     stop(length(missing), " of ", dplyr::n_distinct(blocks$atom_id),
          " documents could not be embedded. First error: ",
          cache$errors[[missing[1]]] %||% "unknown",
-         ". Fix the cause and re-render; documents already embedded are ",
-         "cached and will not be re-sent.")
+         ". Fix the cause and re-run this chunk; documents already embedded ",
+         "are cached and will not be re-sent.")
   cache
 }
 

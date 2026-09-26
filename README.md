@@ -77,7 +77,7 @@ hot_topic/
 ### 01_preprocess.qmd, once per corpus
 
 1. **Point it at your data.** Replace the `corpus` chunk with a read producing `corpus_raw` with columns `atom_id`, `Year` (integer), `body_english`. The default is `quanteda::data_corpus_inaugural`, a real 60-document corpus, so the pipeline runs before you supply anything.
-2. **Set the `embed` row** of the steps table. The first render embeds every document that lacks paragraph markup, one request per document, sleeping at each quota window. Vectors are cached and never re-sent.
+2. **Set the `embed` row** of the steps table. The first render embeds every document that lacks paragraph markup, one request per document, sent `window_n` (300) at a time in parallel with a one-minute rest between windows, which keeps a 500-per-minute limit safe. Hard-wrapped lines are rejoined first. Vectors are cached and never re-sent, except for a document whose block count changed.
 3. **Read the linkage diagnostics.** The median of relinked units should sit near the target, and the merge-similarity percentiles show whether any units were joined to dissimilar neighbors.
 
 ### 02_topics.qmd, iterate until K is settled
@@ -172,7 +172,7 @@ These are the choices that shaped the code and are not obvious from reading it.
 
 ## Requirements
 
-R with `quanteda`, `stm`, `tidytext`, `stopwords`, `furrr`, `here`, `splines`, `viridis`, `tidyverse`, plus `ellmer`, `ragnar`, `clue`, `jsonlite`, and `glue`, used namespaced. The dashboard needs only a browser. Quarto 1.4 or later, rendering to PDF through the bundled Typst engine, so no LaTeX is needed.
+R with `quanteda`, `stm`, `tidytext`, `stopwords`, `furrr`, `here`, `splines`, `viridis`, `tidyverse`, plus `ellmer`, `httr2` (1.1 or later, for `max_active`), `clue`, `jsonlite`, and `glue`, used namespaced. The dashboard needs only a browser. Quarto 1.4 or later, rendering to PDF through the bundled Typst engine, so no LaTeX is needed.
 
 ```bash
 quarto render code/01_preprocess.qmd   # embedding is the long chunk
