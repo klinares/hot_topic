@@ -1,310 +1,108 @@
-# llm_source.R ----------------------------------------------------------------
-# Shared functions for 01_preprocess.qmd, 02_topics.qmd, and 03_stance.qmd:
-#   (1) Prompts and the per-step router
-#   (2) Census classification: sequential calls, sleep at the quota window
-#   (3) Estimation: era proportions, cluster-robust trend, recovery curve
-#   (4) QC and documentation: agreement, class metrics, data-dict.yaml
-#   (5) Table printing that paginates under Typst
-#   (6) Paragraph linkage: blocks, gating, embeddings, calibrated merging
-#   (7) Parse sensitivity: topic matching across refits
-#   (8) Fingerprint guards between scripts
-#   (9) Topic dashboard: one self-contained HTML file
-# Conventions: native |>, no loops (purrr), dplyr namespaced, ellmer namespaced.
+# llm_source.R: shared functions for preprocess.qmd, topics.qmd, stance.qmd.
+# Only function definitions live here; nothing runs when it is sourced.
+#   1. Setup and model calls
+#   2. Output guard (manifest.csv)
+#   3. Paragraph units
+#   4. Topic model helpers
+#   5. Stance trend
+#   6. Tables for Typst
 
-# ---- (1) Prompts and router --------------------------------------------------
+# ---- 1. Setup and model calls ------------------------------------------------
 
-# Every prompt has the same four parts, in this order:
-#   role   expertise framing, so the model reads as the right kind of analyst
-#   task   what to do and how to self-check before answering
-#   rules  guardrails against invention and drift (anti-hallucination slot)
-#   output what to return; paired with a schema that enforces the shape
+`%||%` <- function(x, y) if (is.null(x) || length(x) == 0) y else x
+p_out <- function(f) here::here("outputs", f)
+
+# Every prompt has the same four parts, so each one reads the same way.
 build_prompt <- function(role, task, rules, output) {
-  str_c("ROLE\n", role,
-        "\n\nTASK\n", task,
-        "\n\nRULES\n", str_c("- ", rules, collapse = "\n"),
-        "\n\nOUTPUT\n", output)
+  str_c("ROLE\n", role, "\n\nTASK\n", task, "\n\nRULES\n",
+        str_c("- ", rules, collapse = "\n"), "\n\nOUTPUT\n", output)
 }
 
-# One chat per step. st$steps maps each step to the NAME of the environment
-# variable holding its base URL, plus its model string, so different steps can
-# point at different gateways and no URL or key ever appears in the script.
-# Home uses the OpenRouter helper; work uses the OpenAI-compatible endpoint.
-make_chat <- function(step, system_prompt, cfg_steps, home = FALSE) {
-  cfg <- cfg_steps[cfg_steps$step == step, ]
-  if (nrow(cfg) != 1)
-    stop("No unique config row for step '", step, "' in the steps table.")
+# One chat object per pipeline step. The steps table holds the NAMES of the
+# .Renviron variables for the URL and key, never the values.
+make_chat <- function(step, system_prompt, steps, home = FALSE) {
+  cfg <- steps[steps$step == step, ]
+  if (nrow(cfg) != 1) stop("No unique '", step, "' row in the steps table.")
   if (isTRUE(home)) return(make_chat_home(cfg$model, system_prompt))
-
+  if (utils::packageVersion("ellmer") < "0.4.0")
+    stop("ellmer 0.4.0 or later is needed (credentials argument).")
   url <- Sys.getenv(cfg$base_url_env)
   key <- Sys.getenv(cfg$api_key_env)
-  if (!nzchar(url)) stop("Environment variable ", cfg$base_url_env,
-                         " is empty; set it in .Renviron for step '", step, "'.")
-  if (!nzchar(key)) stop("Environment variable ", cfg$api_key_env,
-                         " is empty; set it in .Renviron for step '", step, "'.")
-  # NOTE: ellmer has ignored api_key= in some versions, so the key is ALSO
-  # exported under the standard name for the duration of this call. If your
-  # ellmer names the argument differently, this is the ONE line to change.
-  withr::with_envvar(c(OPENAI_API_KEY = key), {
-    ellmer::chat_openai_compatible(
-      model = cfg$model, base_url = url, api_key = key,
-      system_prompt = system_prompt,
-      params = ellmer::params(temperature = 0), echo = "none")
-  })
+  if (!nzchar(url) || !nzchar(key))
+    stop("Set ", cfg$base_url_env, " and ", cfg$api_key_env, " in .Renviron.")
+  ellmer::chat_openai_compatible(
+    base_url = url, model = cfg$model, system_prompt = system_prompt,
+    credentials = function() key,
+    params = ellmer::params(temperature = 0), echo = "none")
 }
 
-# ---- (2) Census classification ------------------------------------------------
-
-# One structured call. The chat is clone()d so each call starts from a fresh
-# conversation: without it ellmer appends turns and later paragraphs are judged
-# with earlier ones in context. NULL on failure instead of aborting the run.
-call_one <- function(chat, prompt, schema) {
-  tryCatch(chat$clone()$chat_structured(prompt, type = schema),
-           error = function(e) NULL)
+# Many prompts through one chat, in parallel, under the provider's per-minute
+# limit. Returns a data frame with one row per prompt; a failed call is NA.
+ask_many <- function(chat, prompts, type, rpm = 300L, max_active = 10L) {
+  ellmer::parallel_chat_structured(chat, as.list(prompts), type = type,
+                                   rpm = rpm, max_active = max_active,
+                                   on_error = "continue")
 }
 
-# Classify a character vector sequentially, sleeping when the quota window is
-# spent. Budget is per model, so `window_n` calls then `window_wait` seconds.
-# Recursion, not a loop: each block of window_n is one call to this function.
-# Failures inside a block are left as NA and retried by the caller's rerun,
-# because the incremental store means a re-render re-sends only what is missing.
-classify_census <- function(chat, prompts, ids, schema, window_n, window_wait,
-                            done = 0L) {
-  take   <- seq_len(min(window_n, length(prompts)))
-  res    <- purrr::map(prompts[take], call_one, chat = chat, schema = schema)
-  block  <- tibble::tibble(
-    id    = ids[take],
-    label = purrr::map_chr(res, ~ .x$label %||% NA_character_))
-  done   <- done + length(take)
-  if (length(prompts) <= length(take)) return(block)
-  message(glue::glue("classified {done} of {done + length(prompts) - \\
-                      length(take)}; sleeping {window_wait}s for the quota \\
-                      window to reset"))
-  Sys.sleep(window_wait)
-  dplyr::bind_rows(block,
-    classify_census(chat, prompts[-take], ids[-take], schema,
-                    window_n, window_wait, done))
+# ---- 2. Output guard (manifest.csv) ------------------------------------------
+# A cached output must not outlive the inputs it was built from. manifest.csv
+# records the md5 of each input when an output is written; if an input has
+# changed since, the next render stops and names the file to delete.
+
+manifest_read <- function() {
+  f <- p_out("manifest.csv")
+  if (!file.exists(f)) return(tibble::tibble(output = character(),
+                                             input = character(),
+                                             md5 = character()))
+  readr::read_csv(f, show_col_types = FALSE, col_types = "ccc")
 }
 
-# ---- (3) Estimation ------------------------------------------------------------
-
-# Cluster-robust standard errors on the comment: paragraphs from one author are
-# correlated, so the naive glm SE is too small. This is the sandwich estimator
-# with the comment as the cluster, implemented directly to avoid a dependency.
-# It is a superpopulation (analytic) statement: the corpus is treated as one
-# realization of a comment-generating process. A purely descriptive claim about
-# THIS corpus needs no interval at all, since every paragraph was classified.
-cluster_robust_vcov <- function(model, cluster) {
-  X   <- model.matrix(model)
-  u   <- residuals(model, type = "working") * weights(model, "working")
-  bread <- summary(model)$cov.unscaled
-  meat  <- purrr::map(split(seq_along(cluster), cluster), function(i) {
-    s <- crossprod(X[i, , drop = FALSE], u[i])
-    tcrossprod(s)
-  }) |> purrr::reduce(`+`)
-  G  <- dplyr::n_distinct(cluster)
-  adj <- G / (G - 1)
-  bread %*% meat %*% bread * adj
+md5_of <- function(inputs) {
+  miss <- inputs[!file.exists(inputs)]
+  if (length(miss))
+    stop("Missing input: ", str_c(basename(miss), collapse = ", "),
+         ". Render the earlier script first.")
+  unname(tools::md5sum(inputs))
 }
 
-# Fitted P(outcome) by year with cluster-robust 95 percent intervals.
-trend_curve <- function(d, outcome, cluster, df_spline = 3L) {
-  d   <- dplyr::mutate(d, .y = as.integer(.data[[outcome]]))
-  bs  <- splines::ns(d$Year, df = df_spline)
-  colnames(bs) <- str_c("yr", seq_len(ncol(bs)))
-  dd  <- dplyr::bind_cols(d, tibble::as_tibble(bs))
-  f   <- as.formula(str_c(".y ~ ", str_c(colnames(bs), collapse = " + ")))
-  m   <- glm(f, data = dd, family = quasibinomial())
-  # Separation: when the outcome is perfectly predicted over part of the year
-  # range (every relevant paragraph after some year is "favor", say), the
-  # logistic coefficients diverge, fitted values pin to 0 or 1, and the
-  # interval balloons to [0, 1]. R warns about this for binomial but not for
-  # quasibinomial, so it is checked directly. A separated fit is refused
-  # rather than drawn: its curve and interval are artifacts, not estimates.
-  mu <- stats::fitted(m)
-  if (!m$converged || any(mu < 1e-8 | mu > 1 - 1e-8))
-    stop("separation: the outcome is (nearly) perfectly predicted over part ",
-         "of the year range, so no stable curve can be estimated")
-  V   <- cluster_robust_vcov(m, dd[[cluster]])
-  grid <- sort(unique(d$Year))
-  Xg   <- cbind(1, predict(bs, newx = grid))
-  lp   <- as.numeric(Xg %*% coef(m))
-  se   <- sqrt(rowSums((Xg %*% V) * Xg))
-  # Clustering diagnostic: the ratio of robust to naive standard errors. NOT
-  # the quasibinomial dispersion, which is unidentified for 0/1 outcomes (the
-  # Bernoulli variance is fixed by the mean) and sits near 1 even under heavy
-  # clustering. A ratio near 1 means clustering costs little; 2 means the
-  # naive interval would have been half as wide as it should be.
-  se_ratio <- mean(sqrt(diag(V)) / sqrt(diag(summary(m)$cov.scaled)))
-  tibble::tibble(Year = grid, fit = plogis(lp),
-                 lo = plogis(lp - 1.96 * se), hi = plogis(lp + 1.96 * se),
-                 se_ratio = se_ratio)
+check_inputs <- function(output, inputs) {
+  if (!file.exists(output)) return(invisible(TRUE))
+  old <- dplyr::filter(manifest_read(), output == basename(!!output))
+  if (nrow(old) == 0) return(invisible(TRUE))
+  now <- tibble::tibble(input = basename(inputs), md5_now = md5_of(inputs))
+  changed <- dplyr::inner_join(old, now, by = "input") |>
+    dplyr::filter(md5 != md5_now)
+  if (nrow(changed))
+    stop(str_c(changed$input, collapse = ", "), " changed since ",
+         basename(output), " was built. Delete ", basename(output),
+         " and re-render.")
+  invisible(TRUE)
 }
 
-# Minimum support before a spline trend is attempted for one class: enough
-# positives and negatives to estimate df_spline + 1 coefficients, and
-# positives spread over more distinct years than the spline has degrees of
-# freedom. Returns NULL when supported, otherwise the reason in plain words.
-class_support <- function(y, year, df_spline, min_n) {
-  if (sum(y) < min_n) return(glue::glue("{sum(y)} paragraphs (need {min_n})"))
-  if (sum(1 - y) < min_n)
-    return(glue::glue("only {sum(1 - y)} paragraphs outside the class (need {min_n})"))
-  if (dplyr::n_distinct(year[y == 1]) <= df_spline)
-    return(glue::glue("positives in only {dplyr::n_distinct(year[y == 1])} years"))
-  NULL
+record_inputs <- function(output, inputs) {
+  new <- tibble::tibble(output = basename(output), input = basename(inputs),
+                        md5 = md5_of(inputs))
+  manifest_read() |>
+    dplyr::filter(output != basename(!!output)) |>
+    dplyr::bind_rows(new) |>
+    readr::write_csv(p_out("manifest.csv"))
 }
 
-# Recovery curve: how many paragraphs would have sufficed? Subsamples the
-# census at increasing sizes, refits the trend, and measures the mean absolute
-# deviation from the full-census curve. Costs no API calls, because every
-# paragraph is already labeled. Comments are sampled, not paragraphs, so the
-# subsample has the same clustered shape as a real collection would.
-recovery_curve <- function(d, outcome, sizes, reps, df_spline = 3L, seed = 1L) {
-  full <- trend_curve(d, outcome, "atom_id", df_spline)
-  set.seed(seed)
-  purrr::map(sizes, function(n) {
-    purrr::map(seq_len(reps), function(r) {
-      cl  <- unique(d$atom_id)
-      per <- max(1, round(n / (nrow(d) / length(cl))))
-      sub <- d |> dplyr::filter(atom_id %in% sample(cl, min(per, length(cl))))
-      if (dplyr::n_distinct(sub$Year) < df_spline + 1) return(NULL)
-      # Small subsamples often separate even when the census does not; such a
-      # replicate is skipped, and the count of usable replicates is reported.
-      cur <- tryCatch(trend_curve(sub, outcome, "atom_id", df_spline),
-                      error = function(e) NULL)
-      if (is.null(cur)) return(NULL)
-      tibble::tibble(n_target = n, rep = r, n_actual = nrow(sub),
-                     mad = mean(abs(cur$fit - full$fit[match(cur$Year,
-                                                             full$Year)])))
-    }) |> purrr::list_rbind()
-  }) |> purrr::list_rbind()
+# Compute once, reload afterwards, and refuse to reload a stale result.
+cached <- function(path, inputs, expr) {
+  check_inputs(path, inputs)
+  if (file.exists(path)) return(readRDS(path))
+  x <- force(expr)
+  saveRDS(x, path)
+  record_inputs(path, inputs)
+  x
 }
 
-# ---- (4) QC and documentation --------------------------------------------------
+# ---- 3. Paragraph units ------------------------------------------------------
 
-# Cohen's kappa with raw agreement and the confusion table. Kappa has no
-# validated interpretive thresholds, so all three are reported and none is
-# translated into an adjective.
-agreement <- function(a, b, dnn = c("a", "b")) {
-  keep <- !is.na(a) & !is.na(b)
-  a <- as.character(a[keep]); b <- as.character(b[keep])
-  lev <- sort(union(a, b))
-  po  <- mean(a == b)
-  pe  <- sum(purrr::map_dbl(lev, ~ mean(a == .x) * mean(b == .x)))
-  list(n = length(a), raw = po, kappa = (po - pe) / (1 - pe),
-       confusion = table(a, b, dnn = dnn))
-}
-
-# Per-class precision, recall, F1 and macro-F1 against a reference vector.
-# Macro-F1 is the headline under class imbalance; accuracy is not.
-class_metrics <- function(pred, ref) {
-  keep <- !is.na(pred) & !is.na(ref)
-  pred <- pred[keep]; ref <- ref[keep]
-  per <- purrr::map(sort(union(pred, ref)), function(cl) {
-    tp <- sum(pred == cl & ref == cl); fp <- sum(pred == cl & ref != cl)
-    fn <- sum(pred != cl & ref == cl)
-    pr <- if (tp + fp > 0) tp / (tp + fp) else NA_real_
-    rc <- if (tp + fn > 0) tp / (tp + fn) else NA_real_
-    tibble::tibble(class = cl, precision = pr, recall = rc,
-                   f1 = if (!is.na(pr) && !is.na(rc) && pr + rc > 0)
-                          2 * pr * rc / (pr + rc) else NA_real_,
-                   support = sum(ref == cl))
-  }) |> purrr::list_rbind()
-  list(per_class = per, macro_f1 = mean(per$f1, na.rm = TRUE),
-       accuracy = mean(pred == ref))
-}
-
-# Emit a data-dict.yaml describing the tables written, following the
-# data-dict.yaml specification (Posit). Generated from the objects themselves
-# so it cannot drift from what was written. NOTE: the spec assumes parquet or
-# database tables; these outputs are CSV by project convention, so the document
-# is spec-shaped but the data-dict CLI validator may not run against it.
-emit_data_dict <- function(path, name, description, tables, glossary) {
-  q <- function(x) str_c('"', str_replace_all(x, '"', "'"), '"')
-  var_block <- function(df, descs) {
-    purrr::map_chr(names(df), function(v) str_c(
-      "      - name: ", v,
-      "\n        type: ", dplyr::case_when(
-        is.numeric(df[[v]]) &&
-          isTRUE(all(df[[v]] == round(df[[v]]), na.rm = TRUE)) ~ "integer",
-        is.numeric(df[[v]]) ~ "double",
-        is.logical(df[[v]]) ~ "boolean", TRUE ~ "string"),
-      "\n        description: ", q(descs[[v]] %||% "undocumented"))) |>
-      str_c(collapse = "\n")
-  }
-  writeLines(str_c(
-    "# data-dict.yaml (spec: https://data-dict.tidyverse.org/)\n",
-    "# Generated by 03_stance.qmd; edit the script, not this file.\n",
-    "name: ", name, "\ndescription: ", q(description),
-    "\nversion: ", format(Sys.Date()), "\ntables:\n",
-    purrr::map_chr(tables, function(t) str_c(
-      "  - name: ", t$name, "\n    path: ", t$path,
-      "\n    description: ", q(t$description),
-      "\n    rows: ", nrow(t$data),
-      "\n    variables:\n", var_block(t$data, t$vars))) |>
-      str_c(collapse = "\n"),
-    "\nglossary:\n",
-    purrr::map_chr(names(glossary), function(g) str_c(
-      "  - term: ", q(g), "\n    definition: ", q(glossary[[g]]))) |>
-      str_c(collapse = "\n"), "\n"), path)
-  invisible(path)
-}
-
-# ---- (5) Table printing -------------------------------------------------------
-# Typst does not paginate a captioned table: kable + caption becomes a #figure,
-# and figures do not break across pages, so a long table is clipped no matter
-# what column widths or show rules are set. The fix is to never hand Typst a
-# table taller than a page. tbl_paged() splits the rows into blocks, truncates
-# long character columns, and emits each block as its own pipe table.
-# The chunk MUST carry results: asis. writeLines is used rather than print(),
-# which silently swallows kable output under results: asis.
-tbl_paged <- function(df, caption = NULL, rows = 20L, max_chars = 60L,
-                      digits = 3L) {
-  d <- df |>
-    dplyr::mutate(dplyr::across(dplyr::where(is.numeric), ~ round(.x, digits)),
-                  dplyr::across(dplyr::where(is.character),
-                                ~ str_trunc(.x, max_chars)))
-  pages <- split(d, (seq_len(nrow(d)) - 1L) %/% rows)
-  purrr::iwalk(pages, function(p, i) {
-    n <- as.integer(i) + 1L
-    head <- if (is.null(caption)) NULL else if (n == 1L) caption else
-      str_c(caption, " (continued, ", n, " of ", length(pages), ")")
-    if (!is.null(head)) writeLines(c("", str_c("**", head, "**"), ""))
-    writeLines(knitr::kable(p, format = "pipe"))
-    writeLines("")
-  })
-  invisible(df)
-}
-
-# Long free text does not belong in a table at all: any column width that fits
-# the page makes the text unreadable, and any width that fits the text overflows.
-# tbl_records() prints one short block per row instead, which wraps naturally.
-tbl_records <- function(df, title_col, body_cols, caption = NULL) {
-  if (!is.null(caption)) writeLines(c("", str_c("**", caption, "**"), ""))
-  purrr::pwalk(df, function(...) {
-    r <- list(...)
-    writeLines(str_c("**", r[[title_col]], "**"))
-    writeLines(purrr::map_chr(body_cols, ~ str_c("- ", .x, ": ", r[[.x]])))
-    writeLines("")
-  })
-  invisible(df)
-}
-
-# ---- (6) Paragraph linkage ------------------------------------------------------
-# Blocks are the text between newline runs. Where authors wrote real
-# paragraphs, blocks already are paragraphs; where they put a blank line after
-# every sentence, blocks are orphan sentences. Linkage merges adjacent blocks,
-# most similar pair first, until every unit reaches the size floor. It is the
-# PSU-formation move of combining small units with a contiguous neighbor until
-# the minimum measure of size is met, with semantic similarity choosing which
-# neighbor. Contiguity is never broken, so reading order survives.
-
-# Hard-wrapped text (a line break every few words) splits one sentence into
-# several blocks. A block is a FRAGMENT when the block before it ends without
-# terminal punctuation and it starts with a lowercase letter; fragments are
-# joined back to that block before anything else runs. The rule is deliberately
-# conservative: a wrap before a capitalized word ("I", a name) is left for the
-# embedding linkage to repair, and headings, which are followed by capitalized
-# text, are never absorbed here.
+# Split each comment at line breaks, then rejoin hard-wrapped fragments: a line
+# that follows a line without end punctuation and starts lowercase is the same
+# sentence. A wrap before a capital ("I", a name) is left for the merge step.
 split_blocks <- function(corpus) {
   raw <- corpus |>
     dplyr::mutate(block = str_split(body_english, "\\r?\\n+")) |>
@@ -314,65 +112,32 @@ split_blocks <- function(corpus) {
     dplyr::filter(block != "")
   out <- raw |>
     dplyr::group_by(atom_id) |>
-    dplyr::mutate(fragment = !str_detect(dplyr::lag(block, default = "."),
-                                         "[.!?:;][\"')\\]]*$") &
-                    str_detect(block, "^[a-z]"),
+    dplyr::mutate(fragment = str_detect(block, "^[a-z]") &
+                    !str_detect(dplyr::lag(block, default = "."),
+                                "[.!?:;][\"')\\]]*$"),
                   block_id = cumsum(!fragment)) |>
     dplyr::group_by(atom_id, Year, block_id) |>
-    dplyr::summarise(block = str_c(block, collapse = " "),
-                     n_lines = dplyr::n(), .groups = "drop") |>
-    dplyr::mutate(n_tokens = str_count(block, "\\S+"),
-                  # sentence-ending punctuation followed by space or end;
-                  # a heuristic (abbreviations can overcount), used only to
-                  # find author-formed multi-sentence paragraphs
-                  n_sent = pmax(1L, str_count(block, "[.!?]+(\\s|$)")))
-  attr(out, "rejoin") <- tibble::tibble(
-    lines_in = nrow(raw), blocks_out = nrow(out),
-    fragments_joined = nrow(raw) - nrow(out),
-    median_chars_in = stats::median(nchar(raw$block)),
-    median_chars_out = stats::median(nchar(out$block)),
-    share_no_end_punct = mean(!str_detect(raw$block, "[.!?:;][\"')\\]]*$")))
+    dplyr::summarise(block = str_c(block, collapse = " "), .groups = "drop") |>
+    dplyr::mutate(n_tokens = str_count(block, "\\S+"))
+  attr(out, "lines_in") <- nrow(raw)
   out
 }
 
-# Which documents need linkage, and what length to aim for. A document is
-# UNPARAGRAPHED when its median block is a single sentence: the author put a
-# break after (nearly) every sentence. Paragraphed documents pass through
-# untouched, since their blocks already are the author's paragraphs. The target
-# length is the median of ALL blocks in paragraphed documents, i.e. how long
-# this corpus's authors make a paragraph when they do make one. Stops by name
-# when too few author paragraphs exist to anchor that median.
-plan_linkage <- function(blocks, min_anchor) {
-  doc <- blocks |>
-    dplyr::group_by(atom_id) |>
-    dplyr::summarise(paragraphed = stats::median(n_sent) > 1, .groups = "drop")
-  anchor <- blocks |>
-    dplyr::semi_join(dplyr::filter(doc, paragraphed), by = "atom_id")
-  if (nrow(anchor) < min_anchor)
-    stop("Only ", nrow(anchor), " paragraphs found in documents with paragraph ",
-         "markup; at least ", min_anchor, " are needed to anchor the target ",
-         "length. This corpus has no internal paragraph anchor.")
-  list(doc = doc, target = stats::median(anchor$n_tokens),
-       n_anchor = nrow(anchor), quartiles = stats::quantile(anchor$n_tokens,
-                                                            c(.25, .75)))
-}
-
-# Embedding endpoint for the embed step: URL, key, and model. The OpenAI
-# embeddings format is served by OpenRouter and by OpenAI-compatible gateways.
-embed_endpoint <- function(cfg_steps, home = FALSE) {
-  cfg <- cfg_steps[cfg_steps$step == "embed", ]
+# Embeddings go through httr2 because ellmer has no embedding function. One
+# request per comment; window_n requests in parallel, then window_wait seconds
+# of rest, so no minute sees more than window_n calls. Saved after each
+# window, so a stopped run resumes where it left off.
+embed_endpoint <- function(steps, home = FALSE) {
+  cfg <- steps[steps$step == "embed", ]
   if (nrow(cfg) != 1) stop("No unique 'embed' row in the steps table.")
   if (isTRUE(home)) return(embed_endpoint_home(cfg$model))
-  url <- Sys.getenv(cfg$base_url_env); key <- Sys.getenv(cfg$api_key_env)
+  url <- Sys.getenv(cfg$base_url_env)
+  key <- Sys.getenv(cfg$api_key_env)
   if (!nzchar(url) || !nzchar(key))
     stop("Set ", cfg$base_url_env, " and ", cfg$api_key_env, " in .Renviron.")
   list(url = url, key = key, model = unname(cfg$model))
 }
 
-# One document's blocks as one request. Only model and input are sent, so
-# strict providers that reject extra fields (Mistral, HTTP 422) accept it.
-# Transient failures (429, 503) are retried with backoff; any other HTTP
-# error carries the provider's own message.
 embed_request <- function(txt, ep) {
   httr2::request(ep$url) |>
     httr2::req_url_path_append("embeddings") |>
@@ -383,145 +148,124 @@ embed_request <- function(txt, ep) {
       if (httr2::resp_has_body(resp)) httr2::resp_body_string(resp))
 }
 
-# Response to a matrix, one row per block in input order.
 embed_parse <- function(resp) {
   d <- httr2::resp_body_json(resp)$data
   d <- d[order(purrr::map_int(d, "index"))]
   do.call(rbind, purrr::map(d, function(x) unlist(x$embedding)))
 }
 
-# Embed every comment's blocks, one request per comment. Each window sends up
-# to window_n requests in parallel, then rests window_wait seconds, so no
-# minute ever sees more than window_n calls (set window_n below the provider's
-# per-minute limit). The cache is a list keyed by atom_id and is saved after
-# every window, so an interrupted run resumes without re-sending anything.
-embed_census <- function(blocks, cache_path, cfg_steps, home, window_n,
-                         window_wait, max_active = window_n) {
-  ep <- embed_endpoint(cfg_steps, home)
-  model <- unname(cfg_steps$model[cfg_steps$step == "embed"])
-  cache <- if (file.exists(cache_path)) readRDS(cache_path) else
+embed_all <- function(blocks, path, steps, home, window_n, window_wait) {
+  ep <- embed_endpoint(steps, home)
+  model <- unname(steps$model[steps$step == "embed"])
+  cache <- if (file.exists(path)) readRDS(path) else
     list(model = model, vec = list(), errors = character())
-  if (!identical(unname(cache$model), model))
-    stop("Embedding cache was built with model '", cache$model, "'. Delete ",
-         basename(cache_path), " to re-embed with the configured model.")
-  # A cached vector is reused only if its row count still matches the
-  # document's blocks; a changed parse re-sends that document.
+  if (!identical(cache$model, model))
+    stop("embeddings.rds was built with '", cache$model, "'. Delete it to ",
+         "re-embed with the configured model.")
+  # a cached matrix is reused only if it still has one row per block
   n_blk <- table(blocks$atom_id)
-  stale <- names(cache$vec)[purrr::map_lgl(names(cache$vec), function(id)
-    id %in% names(n_blk) && nrow(cache$vec[[id]]) != n_blk[[id]])]
+  stale <- purrr::keep(names(cache$vec), function(id)
+    id %in% names(n_blk) && nrow(cache$vec[[id]]) != n_blk[[id]])
   cache$vec[stale] <- NULL
   todo <- setdiff(unique(blocks$atom_id), names(cache$vec))
-  n_win <- ceiling(length(todo) / window_n)
-  run_window <- function(ids, cache, w) {
-    if (length(ids) == 0) return(cache)
-    take <- utils::head(ids, window_n)
-    message(glue::glue("window {w} of {n_win}: sending {length(take)} requests"))
-    reqs <- purrr::map(take, function(id)
-      embed_request(blocks$block[blocks$atom_id == id], ep))
-    resps <- httr2::req_perform_parallel(reqs, on_error = "continue",
-                                         max_active = max_active,
-                                         progress = TRUE)
+  windows <- split(todo, ceiling(seq_along(todo) / window_n))
+  cache <- purrr::reduce(seq_along(windows), function(cache, w) {
+    ids <- windows[[w]]
+    message(glue::glue("window {w} of {length(windows)}: {length(ids)} requests"))
+    resps <- purrr::map(ids, function(id)
+      embed_request(blocks$block[blocks$atom_id == id], ep)) |>
+      httr2::req_perform_parallel(on_error = "continue", max_active = window_n,
+                                  progress = TRUE)
     res <- purrr::map(resps, function(r)
       if (inherits(r, "httr2_response"))
-        tryCatch(embed_parse(r), error = function(e) conditionMessage(e))
+        tryCatch(embed_parse(r), error = conditionMessage)
       else conditionMessage(r)) |>
-      purrr::set_names(take)
+      purrr::set_names(ids)
     ok <- purrr::map_lgl(res, is.matrix)
     cache$vec <- c(cache$vec, res[ok])
-    cache$errors <- c(cache$errors[setdiff(names(cache$errors), take[ok])],
+    cache$errors <- c(cache$errors[setdiff(names(cache$errors), ids)],
                       unlist(res[!ok]))
-    saveRDS(cache, cache_path)
-    message(glue::glue("window {w}: {sum(ok)} ok, {sum(!ok)} failed; ",
-                       "{length(cache$vec)} documents cached"))
-    rest <- setdiff(ids, take)
-    if (length(rest) == 0) return(cache)
-    purrr::walk(seq_len(window_wait), function(s) Sys.sleep(1),
-                .progress = glue::glue("resting {window_wait}s"))
-    run_window(rest, cache, w + 1L)
-  }
-  cache <- run_window(todo, cache, 1L)
-  # Failures are never dropped silently: a document without a vector cannot
-  # be linked, and quietly omitting it would remove it from the corpus.
+    saveRDS(cache, path)
+    if (w < length(windows))
+      purrr::walk(seq_len(window_wait), function(s) Sys.sleep(1),
+                  .progress = glue::glue("resting {window_wait}s"))
+    cache
+  }, .init = cache)
   missing <- setdiff(unique(blocks$atom_id), names(cache$vec))
   if (length(missing))
-    stop(length(missing), " of ", dplyr::n_distinct(blocks$atom_id),
-         " documents could not be embedded. First error: ",
+    stop(length(missing), " comments could not be embedded. First error: ",
          cache$errors[[missing[1]]] %||% "unknown",
-         ". Fix the cause and re-run this chunk; documents already embedded ",
-         "are cached and will not be re-sent.")
+         ". Re-run the chunk; embedded comments are not re-sent.")
   cache
+}
+
+# Embed a handful of texts (the stance proposition) with the same model as
+# the corpus, so similarities are comparable. One request.
+embed_texts <- function(txt, steps, home = FALSE) {
+  httr2::req_perform(embed_request(txt, embed_endpoint(steps, home))) |>
+    embed_parse()
 }
 
 cosine <- function(a, b) sum(a * b) / sqrt(sum(a^2) * sum(b^2))
 
-# Link one document's blocks. Among adjacent pairs where at least one block is
-# below the floor, merge the most similar pair; its vector becomes the
-# token-weighted mean of the two (an approximation to re-embedding the merged
-# text, at zero extra calls). Repeat until no block is below the floor or one
-# block remains. Ties resolve to the earlier pair. Deterministic by design:
-# this defines the document unit, so a rerun must reproduce it exactly.
-# Implemented as purrr::reduce over at most m - 1 merge steps carrying a state
-# list, so long documents cannot exhaust the stack the way per-merge recursion
-# does. Adjacent similarities are carried in the state and only the two
-# touching the merged unit are recomputed, so each merge costs O(1) cosines.
-merge_step <- function(st, i) {
-  m <- length(st$txt)
-  if (m == 1L || all(st$n >= st$floor)) return(st)          # done: no-op
-  eligible <- st$n[-m] < st$floor | st$n[-1L] < st$floor
-  k <- which.max(replace(st$sims, !eligible, -Inf))
-  w <- st$n[k:(k + 1L)] / sum(st$n[k:(k + 1L)])
-  st$E[k, ] <- w[1] * st$E[k, ] + w[2] * st$E[k + 1L, ]
-  st$txt[k] <- str_c(st$txt[k], " ", st$txt[k + 1L])
-  st$n[k] <- st$n[k] + st$n[k + 1L]
-  st$b[k] <- st$b[k] + st$b[k + 1L]
-  st$log <- c(st$log, st$sims[k])
-  st$txt <- st$txt[-(k + 1L)]; st$n <- st$n[-(k + 1L)]; st$b <- st$b[-(k + 1L)]
-  st$E <- st$E[-(k + 1L), , drop = FALSE]
-  st$sims <- st$sims[-k]                          # pair (k, k+1) is gone
-  if (k > 1L) st$sims[k - 1L] <- cosine(st$E[k - 1L, ], st$E[k, ])
-  if (k < length(st$txt)) st$sims[k] <- cosine(st$E[k, ], st$E[k + 1L, ])
-  st
-}
-
-link_comment <- function(txt, n, E, floor) {
-  m <- length(txt)
-  sims <- if (m > 1L) purrr::map_dbl(seq_len(m - 1L),
-                                     ~ cosine(E[.x, ], E[.x + 1L, ])) else numeric()
-  st <- purrr::reduce(seq_len(max(0L, m - 1L)), merge_step,
-                      .init = list(txt = txt, n = n, b = rep(1L, m), E = E,
-                                   floor = floor, sims = sims, log = numeric()))
-  list(text = st$txt, n = st$n, n_blocks = st$b,
-       log = tibble::tibble(sim = st$log))
-}
-
-# Apply linkage across the corpus. Paragraphed documents pass through
-# untouched; unparagraphed ones are linked at `floor`. Needs only cached
-# vectors, so it reruns at any floor with no API calls, which is what makes
-# floor calibration and the sensitivity test free.
-link_corpus <- function(blocks, vec, floor, doc) {
-  keep <- doc$atom_id[doc$paragraphed]
-  no_vec <- setdiff(unique(blocks$atom_id), c(keep, names(vec)))
-  if (length(no_vec))
-    stop(length(no_vec), " unparagraphed document(s) have no embedding, ",
-         "e.g. ", no_vec[1], ". Linking without them would drop them from ",
-         "the corpus; re-run the embed chunk.")
+# Similarity of every adjacent pair of blocks in the corpus. Used to set the
+# merge threshold as a quantile, so it means the same thing whichever
+# embedding model produced the vectors (E5 cosines run much higher than
+# others, so a fixed number would not travel between models).
+adjacent_sims <- function(blocks, vec) {
   blocks |>
     dplyr::group_split(atom_id) |>
     purrr::map(function(b) {
-      id <- b$atom_id[1]
-      out <- if (id %in% keep)
-        list(text = b$block, n = b$n_tokens, n_blocks = rep(1L, nrow(b)),
-             log = tibble::tibble(sim = numeric()))
-      else link_comment(b$block, b$n_tokens, vec[[id]], floor)
-      u <- length(out$text)
-      # the document's merge similarities ride on its FIRST unit only, so
-      # unlist() over units counts each merge exactly once
-      tibble::tibble(atom_id = id, Year = b$Year[1], text = out$text,
-                     n_tokens = out$n, n_blocks = out$n_blocks,
-                     relinked = !id %in% keep,
-                     merge_sim = c(list(out$log$sim),
-                                   rep(list(numeric()), u - 1L)))
+      E <- vec[[b$atom_id[1]]]
+      if (nrow(E) < 2) return(numeric())
+      purrr::map_dbl(seq_len(nrow(E) - 1), function(i) cosine(E[i, ], E[i + 1, ]))
     }) |>
+    unlist()
+}
+
+# One merge: of the adjacent pairs that are allowed to merge, join the most
+# similar. A pair is allowed when at least one side is short, the result
+# stays within max_tokens, and the two are similar enough. The merged vector
+# is the token-weighted mean of the two, which avoids re-embedding.
+merge_once <- function(u, min_tokens, max_tokens, min_sim) {
+  k <- length(u$n)
+  if (k < 2) return(u)
+  i <- seq_len(k - 1)
+  sim <- purrr::map_dbl(i, function(j) cosine(u$E[j, ], u$E[j + 1, ]))
+  ok <- (u$n[i] < min_tokens | u$n[i + 1] < min_tokens) &
+    u$n[i] + u$n[i + 1] <= max_tokens & sim >= min_sim
+  if (!any(ok)) return(u)
+  j <- which(ok)[which.max(sim[ok])]
+  w <- u$n[j:(j + 1)] / sum(u$n[j:(j + 1)])
+  u$E[j, ] <- w[1] * u$E[j, ] + w[2] * u$E[j + 1, ]
+  u$text[j] <- str_c(u$text[j], " ", u$text[j + 1])
+  u$n[j] <- u$n[j] + u$n[j + 1]
+  u$n_blocks[j] <- u$n_blocks[j] + u$n_blocks[j + 1]
+  u$text <- u$text[-(j + 1)]; u$n <- u$n[-(j + 1)]
+  u$n_blocks <- u$n_blocks[-(j + 1)]
+  u$E <- u$E[-(j + 1), , drop = FALSE]
+  u
+}
+
+# Merge one comment's blocks until no allowed pair remains. Each step removes
+# one block, so at most (blocks - 1) steps; extra steps change nothing. Units
+# still under min_tokens are kept in the output but flagged keep = FALSE.
+# Each unit carries its vector (vec), which stance.qmd uses for similarity.
+link_comment <- function(b, E, min_tokens, max_tokens, min_sim) {
+  u <- list(text = b$block, n = b$n_tokens, n_blocks = rep(1L, nrow(b)), E = E)
+  u <- purrr::reduce(seq_len(max(0, nrow(b) - 1)), function(u, s)
+    merge_once(u, min_tokens, max_tokens, min_sim), .init = u)
+  tibble::tibble(atom_id = b$atom_id[1], Year = b$Year[1], text = u$text,
+                 n_tokens = u$n, n_blocks = u$n_blocks,
+                 keep = u$n >= min_tokens,
+                 vec = purrr::map(seq_len(nrow(u$E)), function(i) u$E[i, ]))
+}
+
+link_corpus <- function(blocks, vec, min_tokens, max_tokens, min_sim) {
+  blocks |>
+    dplyr::group_split(atom_id) |>
+    purrr::map(function(b)
+      link_comment(b, vec[[b$atom_id[1]]], min_tokens, max_tokens, min_sim)) |>
     purrr::list_rbind() |>
     dplyr::group_by(atom_id) |>
     dplyr::mutate(para_id = dplyr::row_number(),
@@ -529,141 +273,152 @@ link_corpus <- function(blocks, vec, floor, doc) {
     dplyr::ungroup()
 }
 
-# The floor is CALIBRATED, not chosen: merging stops once a unit reaches the
-# floor, so linked units land between one and two floors and their median sits
-# above the floor itself. Bisection finds the floor at which the median length
-# of relinked units matches the target (the author-paragraph median). The
-# output median is nondecreasing in the floor, so bisection is valid; `iters`
-# halvings of (0, target] resolve the floor to target / 2^iters tokens.
-calibrate_floor <- function(blocks, vec, doc, target, iters = 8L) {
-  sub <- blocks |> dplyr::semi_join(dplyr::filter(doc, !paragraphed),
-                                    by = "atom_id")
-  if (nrow(sub) == 0) return(list(floor = target, median_out = NA_real_))
-  med <- function(f) stats::median(link_corpus(sub, vec, f, doc)$n_tokens)
-  step <- function(lo, hi, i) {
-    mid <- (lo + hi) / 2
-    if (i == 0L) return(mid)
-    if (med(mid) < target) step(mid, hi, i - 1L) else step(lo, mid, i - 1L)
-  }
-  f <- step(0, target, iters)
-  list(floor = f, median_out = med(f))
+# ---- 4. Topic model helpers --------------------------------------------------
+
+# Tokens for the topic model: lowercase, letters only, no stopwords, and no
+# month or weekday names, which would let topics encode the year directly.
+clean_tokens <- function(paras) {
+  temporal <- str_to_lower(c(month.name, month.abb, "monday", "tuesday",
+                             "wednesday", "thursday", "friday", "saturday",
+                             "sunday"))
+  paras |>
+    dplyr::select(para_uid, text) |>
+    tidytext::unnest_tokens(word, text) |>
+    dplyr::mutate(word = str_remove_all(word, "'")) |>
+    dplyr::filter(str_detect(word, "^[a-z]{2,}$"),
+                  !word %in% tidytext::get_stopwords()$word,
+                  !word %in% temporal)
 }
 
-# ---- (7) Parse sensitivity -------------------------------------------------------
-# Does the size floor drive the topics? Relink at each multiple of the floor
-# (cached vectors, no API calls), fit STM at the same K, and match every
-# topic to its best counterpart in the baseline fit by the cosine of the
-# topic-word distributions over the shared vocabulary, one-to-one via the
-# Hungarian algorithm. Reported as similarities, with no invented pass mark.
+# Tokens to stm's input format: a vocabulary, and per paragraph a 2-row
+# integer matrix of (word index, count). Words in fewer than min_docfreq
+# paragraphs are dropped.
+stm_input <- function(tokens, min_docfreq) {
+  counts <- tokens |>
+    dplyr::count(para_uid, word) |>
+    dplyr::add_count(word, name = "docfreq") |>
+    dplyr::filter(docfreq >= min_docfreq)
+  vocab <- sort(unique(counts$word))
+  counts <- dplyr::mutate(counts, i = match(word, vocab)) |> dplyr::arrange(para_uid, i)
+  documents <- split(counts, counts$para_uid) |>
+    purrr::map(function(d) rbind(as.integer(d$i), as.integer(d$n)))
+  list(documents = documents, vocab = vocab)
+}
+
+# Topic-word probabilities as a matrix with the vocabulary as column names.
 beta_matrix <- function(fit) {
   b <- exp(fit$beta$logbeta[[1]])
   colnames(b) <- fit$vocab
   b
 }
 
+# Match each baseline topic to one topic of another fit (Hungarian
+# assignment on topic-word cosine over the shared vocabulary).
 match_topics <- function(b_ref, b_alt) {
   v <- intersect(colnames(b_ref), colnames(b_alt))
-  norm_rows <- function(m) m / sqrt(rowSums(m^2))
-  S <- norm_rows(b_ref[, v, drop = FALSE]) %*%
-    t(norm_rows(b_alt[, v, drop = FALSE]))
-  assign <- clue::solve_LSAP(S, maximum = TRUE)
-  tibble::tibble(topic = seq_len(nrow(S)),
-                 matched = as.integer(assign),
-                 cosine = S[cbind(seq_len(nrow(S)), as.integer(assign))],
+  a <- b_ref[, v, drop = FALSE]; b <- b_alt[, v, drop = FALSE]
+  sim <- (a %*% t(b)) / outer(sqrt(rowSums(a^2)), sqrt(rowSums(b^2)))
+  m <- clue::solve_LSAP(sim, maximum = TRUE)
+  tibble::tibble(topic = seq_len(nrow(sim)), matched = as.integer(m),
+                 cosine = sim[cbind(seq_len(nrow(sim)), as.integer(m))],
                  shared_vocab = length(v))
 }
 
-# ---- (8) Fingerprint guards between scripts ---------------------------------------
-# Caches track files, not code, and with three scripts the classic failure is
-# rerunning an upstream script and reloading a downstream cache built from the
-# old inputs. Every guarded output carries a sidecar, <output>.inputs.csv,
-# listing the md5 of each input file it was built from. md5 rather than
-# modification time, because a re-render that writes identical content must
-# not trip the guard.
+# ---- 5. Trends over time ---------------------------------------------------------
 
-fingerprint <- function(inputs) {
-  missing <- inputs[!file.exists(inputs)]
-  if (length(missing))
-    stop("Input file(s) not found: ", str_c(basename(missing), collapse = ", "),
-         ". Render the upstream script first.")
-  tibble::tibble(file = basename(inputs), md5 = unname(tools::md5sum(inputs)))
+# Standard errors clustered on comment, since paragraphs from one comment
+# are correlated (sandwich estimator written out to avoid a dependency).
+cluster_vcov <- function(model, cluster) {
+  X <- stats::model.matrix(model)
+  u <- stats::residuals(model, type = "working") * stats::weights(model, "working")
+  S <- rowsum(X * u, cluster)  # score sums per comment
+  G <- nrow(S)
+  bread <- summary(model)$cov.unscaled
+  bread %*% crossprod(S) %*% bread * G / (G - 1)
 }
 
-# Stop by name when an existing output was built from different inputs.
-# strict = FALSE tolerates a missing sidecar (a file you created by hand).
-check_fingerprint <- function(output, inputs, strict = TRUE) {
-  side <- str_c(output, ".inputs.csv")
-  if (!file.exists(output)) return(invisible(TRUE))
-  if (!file.exists(side)) {
-    if (strict) stop(basename(output), " has no input fingerprint, so its ",
-                     "provenance is unknown. Delete it once and re-render.")
-    return(invisible(TRUE))
-  }
-  old <- readr::read_csv(side, show_col_types = FALSE)
-  new <- fingerprint(inputs)
-  changed <- new$file[!new$md5 %in% old$md5[match(new$file, old$file)]]
-  if (length(changed))
-    stop(str_c(changed, collapse = ", "), " changed since ", basename(output),
-         " was built. Delete ", basename(output), " (and anything built from ",
-         "it) once, then re-render.")
-  invisible(TRUE)
+# P(class) by year: logistic regression on a year spline with clustered
+# 95% intervals; w are sampling weights (1 for a census). With fewer than 10 paragraphs on the smaller side the curve
+# is a straight line in year (2 parameters instead of df_spline + 1); under
+# min_n, or when the class is certain over part of the years, it refuses.
+# The degrees of freedom used ride along in the df column.
+trend_curve <- function(y, year, cluster, df_spline = 2L, min_n = 5L,
+                        w = rep(1, length(y))) {
+  small <- min(sum(y), sum(1 - y))
+  if (small < min_n)
+    stop(glue::glue("too few paragraphs on one side ({sum(y)} in, {sum(1 - y)} out; need {min_n})"))
+  df <- if (small < 10) 1L else df_spline
+  bs <- splines::ns(year, df = df)
+  m <- stats::glm(y ~ bs, family = stats::quasibinomial(), weights = w)
+  mu <- stats::fitted(m)
+  if (!m$converged || any(mu < 1e-8 | mu > 1 - 1e-8))
+    stop("separation: the class is (nearly) certain over part of the years")
+  V <- cluster_vcov(m, cluster)
+  grid <- sort(unique(year))
+  X <- cbind(1, stats::predict(bs, newx = grid))
+  lp <- as.numeric(X %*% stats::coef(m))
+  se <- sqrt(rowSums((X %*% V) * X))
+  tibble::tibble(Year = grid, fit = stats::plogis(lp),
+                 lo = stats::plogis(lp - 1.96 * se),
+                 hi = stats::plogis(lp + 1.96 * se), df = df)
 }
 
-write_fingerprint <- function(output, inputs)
-  readr::write_csv(fingerprint(inputs), str_c(output, ".inputs.csv"))
-
-# Checkpoint that refuses to reload a stale cache. Compute once, save with its
-# fingerprint, reload thereafter; stop if any input has changed since.
-cache_guarded <- function(path, inputs, expr) {
-  check_fingerprint(path, inputs)
-  if (file.exists(path))
-    return(if (str_detect(path, "\\.csv$"))
-      readr::read_csv(path, show_col_types = FALSE) else readRDS(path))
-  x <- force(expr)
-  if (str_detect(path, "\\.csv$")) readr::write_csv(x, path) else saveRDS(x, path)
-  write_fingerprint(path, inputs)
-  x
+# Weighted share of a 0/1 outcome with a 95% interval clustered by comment
+# (linearization). Stratification is ignored, which errs toward wider
+# intervals.
+share_ci <- function(y, cluster, w = rep(1, length(y))) {
+  p <- sum(w * y) / sum(w)
+  z <- tapply(w * (y - p), cluster, sum) / sum(w)
+  G <- length(z)
+  se <- sqrt(G / (G - 1) * sum(z^2))
+  tibble::tibble(share = p, lo = max(0, p - 1.96 * se), hi = min(1, p + 1.96 * se))
 }
 
-# ---- (9) Topic dashboard ---------------------------------------------------------
-# One self-contained HTML file: no server, no internet, opens from disk or
-# GitHub Pages. The data travel as one JSON block inside the page. It embeds
-# the full corpus text, so publishing the file republishes every document.
-# `stance` is an optional named vector, para_uid -> label, from 03_stance.qmd.
-write_dashboard <- function(path, template, paragraph_theta, codebook, trends,
-                            stance = NULL, title = "Topic dashboard") {
-  paras <- paragraph_theta |>
-    dplyr::arrange(atom_id, para_id) |>
-    dplyr::transmute(uid = para_uid, atom = atom_id, year = as.integer(Year),
-                     topic = as.integer(topic), theta = round(theta_max, 3),
-                     text)
-  topics <- codebook |>
-    dplyr::select(dplyr::any_of(c("topic", "label", "description",
-                                  "proposition", "prevalence", "avepp",
-                                  "frex"))) |>
-    dplyr::mutate(topic = as.integer(topic)) |>
-    dplyr::arrange(dplyr::desc(prevalence))
-  tr <- trends |>
-    dplyr::group_split(topic) |>
-    purrr::map(~ list(Year = .x$Year, fit = round(.x$fit, 4),
-                      lo = round(.x$lo, 4), hi = round(.x$hi, 4))) |>
-    purrr::set_names(purrr::map_chr(dplyr::group_split(trends, topic),
-                                    ~ as.character(.x$topic[1])))
-  # Paragraphs travel as columns (compact); topics as one object per topic,
-  # which is the shape the page iterates over.
-  data <- list(built = format(Sys.Date()), topics = purrr::pmap(topics, list),
-               paras = paras,
-               trends = tr,
-               stance = if (length(stance)) as.list(stance) else NULL)
-  # "</" inside the JSON would close the <script> block early; "<\/" is the
-  # same string to the JSON parser and harmless to the HTML parser.
-  json <- jsonlite::toJSON(data, dataframe = "columns", auto_unbox = TRUE,
-                           null = "null", na = "null", digits = NA) |>
-    as.character() |>
-    str_replace_all(stringr::fixed("</"), "<\\\\/")
-  html <- readr::read_file(template) |>
-    str_replace_all(stringr::fixed("{{TITLE}}"), title) |>
-    str_replace(stringr::fixed("{{DATA}}"), json)
-  readr::write_file(html, path)
-  invisible(path)
+# Expected share of topic k by year. A fractional logit (quasibinomial glm on
+# the topic share; Papke and Wooldridge 1996) keeps every prediction between
+# 0 and 1, unlike the linear model in stm::estimateEffect, which can predict
+# negative shares. It is refit on each draw of theta from the fitted STM and
+# the draws are combined on the logit scale (mean, plus within- and
+# between-draw variance), so the interval carries the topic model's own
+# uncertainty as well as clustering by comment.
+topic_trend <- function(draws, k, bs, grid, cluster) {
+  X <- cbind(1, stats::predict(bs, newx = grid))
+  fits <- purrr::map(draws, function(th) {
+    m <- stats::glm(th[, k] ~ bs, family = stats::quasibinomial())
+    V <- cluster_vcov(m, cluster)
+    list(lp = as.numeric(X %*% stats::coef(m)), v = rowSums((X %*% V) * X))
+  })
+  lp <- do.call(cbind, purrr::map(fits, "lp"))
+  v <- do.call(cbind, purrr::map(fits, "v"))
+  est <- rowMeans(lp)
+  se <- sqrt(rowMeans(v) + (1 + 1 / ncol(lp)) * apply(lp, 1, stats::var))
+  tibble::tibble(Year = grid, topic = k, fit = stats::plogis(est),
+                 lo = stats::plogis(est - 1.96 * se),
+                 hi = stats::plogis(est + 1.96 * se))
+}
+
+# ---- 6. Tables for Typst ---------------------------------------------------------
+# Typst will not break a captioned table across pages, so long tables are
+# printed in blocks of `rows`. Chunks that call these need results: asis.
+
+tbl_paged <- function(df, caption = NULL, rows = 20L, max_chars = 60L) {
+  d <- df |>
+    dplyr::mutate(dplyr::across(dplyr::where(is.numeric), function(x) round(x, 3)),
+                  dplyr::across(dplyr::where(is.character),
+                                function(x) str_trunc(x, max_chars)))
+  if (!is.null(caption)) writeLines(c("", str_c("**", caption, "**"), ""))
+  split(d, (seq_len(nrow(d)) - 1L) %/% rows) |>
+    purrr::walk(function(p) writeLines(c(knitr::kable(p, format = "pipe"), "")))
+  invisible(df)
+}
+
+# Long text reads better as one short block per row than as a table.
+tbl_records <- function(df, title_col, body_cols, caption = NULL) {
+  if (!is.null(caption)) writeLines(c("", str_c("**", caption, "**"), ""))
+  purrr::pwalk(df, function(...) {
+    r <- list(...)
+    writeLines(c(str_c("**", r[[title_col]], "**"),
+                 str_c("- ", body_cols, ": ", unlist(r[body_cols])), ""))
+  })
+  invisible(df)
 }

@@ -1,198 +1,146 @@
 ---
-title: "Preprocessing: documents to paragraph units"
-subtitle: "Script 1 of 4: validation, paragraph linkage, handoff"
+title: "Preprocessing: comments to paragraph units"
+subtitle: "Step 1 of 3. Then topics.qmd, then stance.qmd"
 format:
   typst:
     toc: false
     fig-width: 9
-    fig-height: 5.5
+    fig-height: 5
 execute:
   warning: false
   message: false
 ---
 
-```{=typst}
-#show figure: set block(breakable: true)
-```
-
-```{=html}
-<!--
-RUN ORDER (script 1 of 4; then 02_topics.qmd, 03_stance.qmd, 04_dashboard.qmd)
-  1. Replace the Corpus chunk with your own read:
-       corpus_raw <- readr::read_csv(here("input", "YOUR_FILE.csv"))
-     Required columns: atom_id (document id), Year (integer), body_english.
-  2. Set the embed row of tx$steps. The first render embeds every
-     unparagraphed document, one request each, window_n requests in
-     parallel then a window_wait rest. Vectors are cached in block_embeddings.rds and never re-sent;
-     changing the embedding model means deleting that file.
-  3. Read the linkage diagnostics. Scripts 2 and 3 carry fingerprints of
-     paragraphs.csv, so if this script's output changes they stop by name
-     and tell you what to delete, rather than reloading stale results.
-This script is corpus-agnostic: it needs only the three columns above.
-OUTPUTS (all in outputs/): paragraphs.csv, blocks.csv, linkage_plan.rds,
-block_embeddings.rds.
--->
-```
-
 ```{r config}
 tx <- list(
-  seed = 2026L,
-  min_anchor = 30L,  # author paragraphs needed to anchor the target length
-  window_n = 300L,  # requests sent in parallel per window (limit is 500/min)
+  min_tokens = 60L,  # a unit needs at least this many words for the topic model
+  max_tokens = 150L,  # a merge may not grow a unit past this; keeps topics apart
+  min_sim_quantile = 0.20,  # pairs less similar than this share of all neighbors never merge
+  window_n = 300L,  # embedding requests per minute (limit is 500)
   window_wait = 60L,  # seconds to rest between windows
-  max_active = 300L,  # simultaneous connections; lower if the gateway refuses
-  use_openrouter = TRUE,  # FALSE to use the OpenAI-compatible endpoint
-  # base_url_env and api_key_env are the NAMES of .Renviron variables, so
-  # nothing sensitive appears here. Ignored when use_openrouter = TRUE.
+  use_openrouter = TRUE,  # FALSE at work
   steps = tibble::tribble(
     ~step, ~base_url_env, ~api_key_env, ~model,
-    "embed", "COMPASS_EMBED_URL", "COMPASS_EMBED_KEY", "MODEL-FOR-EMBEDDING")
-)
+    "embed", "COMPASS_EMBED_URL", "COMPASS_EMBED_KEY", "MODEL-FOR-EMBEDDING"))
 
 suppressPackageStartupMessages({
   library(here); library(viridis)
-  library(tidyverse)  # tidyverse LAST so its verbs win
+  library(tidyverse)  # tidyverse last so its verbs win
 })
-# Used namespaced: httr2 (embeddings), glue, quanteda (default corpus only).
 theme_set(theme_minimal(base_size = 12))
-options(knitr.table.max.print = Inf, knitr.kable.max_rows = Inf,
-        max.print = 1e6)
-set.seed(tx$seed)
-`%||%` <- function(x, y) if (is.null(x)) y else x
-p_out <- function(f) here::here("outputs", f)
 source(here::here("code", "llm_source.R"))
 if (isTRUE(tx$use_openrouter)) {
   source(here::here("code", "llm_openrouter.R"))
   tx$steps$model <- open_router_models[tx$steps$step]
 }
-dir.create(here::here("outputs"), showWarnings = FALSE, recursive = TRUE)
+dir.create(here::here("outputs"), showWarnings = FALSE)
 ```
 
 # Corpus
 
-The default corpus is `quanteda::data_corpus_inaugural`: 60 US inaugural addresses, 1789 to 2025, with `Year` already carried as a docvar. It ships with quanteda, so there is no extra dependency, and it is a real corpus of multi-paragraph documents rather than a simulation, so the linkage runs against text that behaves like text.
-
-Two properties worth knowing before you read anything into the results. It yields about 1,874 paragraphs, roughly a tenth of a production corpus, so K in `02_topics.qmd` belongs in the low teens. And it has **one document per year**, so document clusters and year strata coincide; that is fine for preprocessing and topic modeling, but the cluster-robust variance in `03_stance.qmd` cannot be exercised on it.
-
-**For your own data**, replace this chunk with the read of your own table. Everything downstream is unchanged; the validation gate below runs on whatever filled `corpus_raw`.
+Needs three columns: `atom_id` (comment id), `Year` (integer), `body_english` (text). The default below is a demonstration corpus that ships with quanteda; at work replace it with one line reading your file.
 
 ```{r corpus}
 corpus_raw <- tibble(
   atom_id = quanteda::docnames(quanteda::data_corpus_inaugural),
   Year = quanteda::docvars(quanteda::data_corpus_inaugural, "Year"),
   body_english = as.character(quanteda::data_corpus_inaugural))
-
-# For your own data, this chunk becomes one line:
+# At work:
 # corpus_raw <- readr::read_csv(here("input", "YOUR_FILE.csv"))
-# Required columns: atom_id (document id), Year (integer), body_english (text).
 ```
-
-# Corpus validation (keep this at work)
-
-Stops the render with a named error on a bad read, which is cheaper than debugging a silent failure five chunks later.
 
 ```{r validate}
+#| results: asis
 miss <- setdiff(c("atom_id", "Year", "body_english"), names(corpus_raw))
-if (length(miss)) stop("corpus_raw missing column(s): ",
-                       str_c(miss, collapse = ", "))
-stopifnot(
-  "atom_id must be unique"     = !anyDuplicated(corpus_raw$atom_id),
-  "Year must be integer-valued" = all(corpus_raw$Year ==
-                                        as.integer(corpus_raw$Year)),
-  "body_english must be character" = is.character(corpus_raw$body_english))
+if (length(miss)) stop("corpus_raw is missing: ", str_c(miss, collapse = ", "))
+stopifnot("atom_id must be unique" = !anyDuplicated(corpus_raw$atom_id),
+          "Year must be whole numbers" = all(corpus_raw$Year == round(corpus_raw$Year), na.rm = TRUE))
 n0 <- nrow(corpus_raw)
-corpus_raw <- corpus_raw |>
-  dplyr::filter(!is.na(Year), !is.na(body_english),
-                str_squish(body_english) != "")
-glue::glue("Validation: kept {nrow(corpus_raw)} of {n0} comments, ",
-           "{min(corpus_raw$Year)}-{max(corpus_raw$Year)}")
+corpus_raw <- dplyr::filter(corpus_raw, !is.na(Year), !is.na(body_english),
+                            str_squish(body_english) != "")
+writeLines(glue::glue("Kept {nrow(corpus_raw)} of {n0} comments, \\
+  {min(corpus_raw$Year)} to {max(corpus_raw$Year)}."))
 ```
 
-# Paragraph linkage
+# From lines to paragraph units
 
-Documents rarely arrive with clean paragraphs. Some authors write real paragraphs; others put a blank line after every sentence, and splitting on blank lines then yields orphan sentences too short for a topic model, which is where the STM falls apart. This section rebuilds units of a defensible length without assuming either convention and without a hand-picked size.
+Most comments here break after every sentence, so splitting at line breaks gives orphan sentences too short for a topic model. Three steps rebuild usable units.
 
-**Blocks** are the text between newline runs. Hard-wrapped text (a line break every few words) is repaired first: a line that follows a line without terminal punctuation and starts with a lowercase letter is a fragment of the same sentence and is joined back. The rule is conservative on purpose; a wrap before a capitalized word is left to the embedding linkage. **Which documents need linkage** is decided per document: a document is *unparagraphed* when its median block is a single sentence, meaning the author broke after nearly every sentence. Paragraphed documents pass through untouched, because their blocks already are the author's paragraphs. That rule has no tuned threshold.
+1. **Split and repair.** Text is split at line breaks. A line that follows a line without end punctuation and starts lowercase is a wrapped piece of the same sentence and is joined back.
+2. **Merge by meaning.** Every comment is embedded, one vector per block. Within a comment, the most similar pair of *neighboring* blocks is merged first, as long as one of them is shorter than `min_tokens`, the result stays within `max_tokens`, and the two are at least as similar as the `min_sim_quantile` point of all neighboring pairs in the corpus. This repeats until no pair qualifies. Reading order is never broken.
+3. **Drop what cannot be placed.** A unit still under `min_tokens` had no neighbor it was similar enough to join without breaking the size ceiling. It is left out of the topic model rather than forced into a paragraph it would distort, and written to `dropped_units.csv` so you can read what was lost.
 
-**The target length comes from the corpus.** It is the median length of all paragraphs in the paragraphed documents: how long this corpus's authors make a paragraph when they do make one. If fewer than `r tx$min_anchor` such paragraphs exist, the render stops by name rather than falling back to an arbitrary number; that guard protects the stability of the median and is not a tuning knob.
-
-**Linkage is agglomerative with a contiguity constraint**, the PSU-formation move of combining small units with a neighbor until a minimum measure of size is met. Within each unparagraphed document, among adjacent pairs where at least one block is below the floor, the most semantically similar pair merges first, repeating until every unit reaches the floor. Orphans link to each other when they belong together, a heading joins the paragraph it introduces because it shares its vocabulary, and a block reaches across to a dissimilar neighbor only when nothing better remains. Reading order is never broken. The procedure is deterministic, so no random start is involved: it defines the document unit, and a rerun must reproduce it exactly.
-
-**The floor is calibrated, not chosen.** Because merging stops once a unit reaches the floor, linked units land between one and two floors, so the output median sits above the floor. The floor is therefore found by search: the value at which the median length of relinked units matches the target. The whole method reduces to one statement a reader can check: *unparagraphed documents were relinked into units whose median length matches the median length of author-formed paragraphs in the same corpus.*
-
-**Similarity is cosine on embeddings** of the raw block text. Only unparagraphed documents are embedded, one request per document, sent `r tx$window_n` at a time in parallel with a `r tx$window_wait`-second rest between windows, and vectors are cached so nothing is sent twice. After a merge, the unit's vector is the token-weighted mean of its parts, an approximation to re-embedding the merged text adopted because it costs no extra requests. Calibration and the sensitivity test reuse the cached vectors, so neither makes an API call.
+The two token settings are the balance you are choosing: `min_tokens` is enough text for the topic model to read, `max_tokens` is the point past which a unit starts to hold more than one subject. `topics.qmd` refits the topic model at other settings to show whether that choice drives the topics.
 
 ```{r blocks}
 #| results: asis
 blocks <- split_blocks(corpus_raw)
-attr(blocks, "rejoin") |>
-  tidyr::pivot_longer(dplyr::everything(), names_to = "measure") |>
-  dplyr::mutate(value = round(value, 3)) |>
-  tbl_paged(caption = "Line-break repair. share_no_end_punct is the share of raw lines that end without terminal punctuation; high values with a short median mean hard-wrapped text. fragments_joined lines were rejoined to the line before them.")
-plan <- plan_linkage(blocks, tx$min_anchor)
-n_unpar <- sum(!plan$doc$paragraphed)
-writeLines(glue::glue("{nrow(blocks)} blocks from {nrow(plan$doc)} documents. \\
-  {sum(plan$doc$paragraphed)} documents have paragraph markup and pass through \\
-  untouched; {n_unpar} are unparagraphed and will be relinked. Target length = \\
-  {plan$target} tokens (median of {plan$n_anchor} author paragraphs; \\
-  interquartile range {plan$quartiles[1]} to {plan$quartiles[2]})."))
-writeLines(glue::glue("Embedding requests needed: {n_unpar} (one per \\
-  unparagraphed document), {ceiling(n_unpar / tx$window_n)} window(s), about \\
-  {ceiling(n_unpar / tx$window_n) - 1} minute(s) of rest."))
+tibble(measure = c("lines", "blocks after rejoining wrapped lines",
+                   "median words per block", "blocks under min_tokens"),
+       value = c(attr(blocks, "lines_in"), nrow(blocks),
+                 stats::median(blocks$n_tokens),
+                 sum(blocks$n_tokens < tx$min_tokens))) |>
+  tbl_paged(caption = "Blocks before merging.")
 ```
 
 ```{r embed}
-unpar_blocks <- blocks |>
-  dplyr::semi_join(dplyr::filter(plan$doc, !paragraphed), by = "atom_id")
-emb <- if (nrow(unpar_blocks) == 0) list(vec = list()) else
-  embed_census(unpar_blocks, p_out("block_embeddings.rds"), tx$steps,
-               tx$use_openrouter, tx$window_n, tx$window_wait, tx$max_active)
+emb <- embed_all(blocks, p_out("embeddings.rds"), tx$steps, tx$use_openrouter,
+                 tx$window_n, tx$window_wait)
 ```
 
 ```{r link}
 #| results: asis
-cal <- calibrate_floor(blocks, emb$vec, plan$doc, plan$target)
-paragraphs <- link_corpus(blocks, emb$vec, cal$floor, plan$doc) |>
-  dplyr::select(para_uid, atom_id, para_id, Year, n_tokens, text, relinked,
-                n_blocks, merge_sim)
+sims <- adjacent_sims(blocks, emb$vec)
+min_sim <- stats::quantile(sims, tx$min_sim_quantile, names = FALSE)
+units <- link_corpus(blocks, emb$vec, tx$min_tokens, tx$max_tokens, min_sim)
+paragraphs <- dplyr::filter(units, keep)
+dropped <- dplyr::filter(units, !keep)
 
-rl <- dplyr::filter(paragraphs, relinked)
-sims <- unlist(rl$merge_sim)
-tibble::tibble(
-  measure = c("blocks in", "paragraphs out", "calibrated floor (tokens)",
-              "target: median author paragraph", "median of relinked units",
-              "relinked units", "merges performed (blocks absorbed)",
-              "relinked units below floor (whole short documents)",
-              "merge similarity, median", "merge similarity, 10th percentile"),
-  value = c(nrow(blocks), nrow(paragraphs), round(cal$floor, 1), plan$target,
-            stats::median(rl$n_tokens), nrow(rl), sum(rl$n_blocks - 1L),
-            sum(rl$n_tokens < cal$floor),
-            round(stats::median(sims), 3),
-            round(stats::quantile(sims, .1, names = FALSE), 3))) |>
-  tbl_paged(caption = "Linkage diagnostics. The median of relinked units should sit near the target. A low 10th-percentile merge similarity means some units joined a dissimilar neighbor because nothing better remained; read those before trusting the parse.")
+tibble(measure = c("similarity threshold (cosine)", "units formed",
+                   "units kept", "units dropped", "words dropped (share)",
+                   "comments with nothing kept", "median words per kept unit",
+                   "median blocks per kept unit"),
+       value = c(round(min_sim, 3), nrow(units), nrow(paragraphs), nrow(dropped),
+                 round(sum(dropped$n_tokens) / sum(units$n_tokens), 3),
+                 dplyr::n_distinct(corpus_raw$atom_id) - dplyr::n_distinct(paragraphs$atom_id),
+                 stats::median(paragraphs$n_tokens), stats::median(paragraphs$n_blocks))) |>
+  tbl_paged(caption = "Merging results. Watch the share of words dropped and the comments with nothing kept: if either is large, lower min_tokens or min_sim_quantile.")
+```
+
+```{r units-plot}
+#| fig-cap: "Words per kept unit. Units pile up between min_tokens and max_tokens (dashed); long author paragraphs sit to the right and are never split."
+ggplot(paragraphs, aes(n_tokens)) +
+  geom_histogram(bins = 40, fill = viridis(1, begin = 0.35)) +
+  geom_vline(xintercept = c(tx$min_tokens, tx$max_tokens), linetype = 2) +
+  labs(x = "words per unit", y = "units")
+```
+
+```{r dropped-plot}
+#| fig-cap: "Share of words dropped by year. Dropping is not neutral if it concentrates in some years: those years then rest on longer, better-formed comments."
+units |>
+  dplyr::group_by(Year) |>
+  dplyr::summarise(dropped = sum(n_tokens[!keep]) / sum(n_tokens)) |>
+  ggplot(aes(Year, dropped)) +
+  geom_col(fill = viridis(1, begin = 0.6)) +
+  labs(x = NULL, y = "share of words dropped")
 ```
 
 # Handoff
 
-Everything the downstream scripts need is written here, and nothing downstream reruns this script's work. `paragraphs.csv` is the corpus for `02_topics.qmd`. `blocks.csv` and `linkage_plan.rds` let script 2 relink at other floors for the sensitivity test using the cached vectors, with no API calls.
-
-```{r volume}
-#| fig-cap: "Paragraph units by year: the denominator for every time-indexed estimate downstream. Thin years mean trend splines are interpolating there."
-paragraphs |>
-  dplyr::count(Year) |>
-  ggplot(aes(Year, n)) +
-  geom_col(fill = viridis(1, begin = 0.35)) +
-  labs(x = NULL, y = "paragraph units")
-```
-
 ```{r handoff}
 #| results: asis
-readr::write_csv(dplyr::select(paragraphs, -merge_sim), p_out("paragraphs.csv"))
+readr::write_csv(dplyr::select(paragraphs, para_uid, atom_id, para_id, Year,
+                               n_tokens, n_blocks, text), p_out("paragraphs.csv"))
+readr::write_csv(dplyr::select(dropped, atom_id, Year, n_tokens, text),
+                 p_out("dropped_units.csv"))
 readr::write_csv(blocks, p_out("blocks.csv"))
-saveRDS(list(doc = plan$doc, target = plan$target, n_anchor = plan$n_anchor,
-             floor = cal$floor), p_out("linkage_plan.rds"))
+saveRDS(list(min_tokens = tx$min_tokens, max_tokens = tx$max_tokens,
+             min_sim = min_sim), p_out("merge_settings.rds"))
+# one vector per kept paragraph, rows named by para_uid, for stance.qmd
+vectors <- do.call(rbind, paragraphs$vec)
+rownames(vectors) <- paragraphs$para_uid
+saveRDS(vectors, p_out("paragraph_vectors.rds"))
 writeLines(glue::glue("Wrote paragraphs.csv ({nrow(paragraphs)} units), \\
-  blocks.csv ({nrow(blocks)} blocks), linkage_plan.rds (floor \\
-  {round(cal$floor, 1)}, target {plan$target}), block_embeddings.rds. \\
-  Next: 02_topics.qmd."))
+  dropped_units.csv ({nrow(dropped)}), blocks.csv, merge_settings.rds, \\
+  paragraph_vectors.rds, embeddings.rds. Next: topics.qmd."))
 ```

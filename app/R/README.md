@@ -5,7 +5,7 @@ Which topics emerge in public comments over time, and how they change. Three Qua
 ```
 code/preprocess.qmd  comments -> paragraph units
 code/topics.qmd      paragraph units -> STM topics, codebook, trends
-code/stance.qmd      one claim -> stance and attention trends (experimental)
+code/stance.qmd      one topic -> stance trend (experimental)
 app/                 dashboard over the topics outputs
 ```
 
@@ -15,7 +15,7 @@ app/                 dashboard over the topics outputs
 
 1. **preprocess.qmd.** Replace the corpus chunk with your read (`atom_id`, `Year`, `body_english`). Set `min_tokens` and `max_tokens`. The first run embeds every comment; later runs reuse `embeddings.rds`.
 2. **topics.qmd.** Once with `run_searchK = TRUE` to choose K, then set `K`. Once with `run_sensitivity = TRUE` to check the merge settings. The first full run drafts `topic_codebook.csv`; edit it by hand, it is never redrafted while it exists.
-3. **stance.qmd** (experimental). Write the claim and its negation, and a short `name` for its files. It reads only preprocess outputs: every paragraph is scored by embedding similarity to the claim, a stratified sample (300 by default) is coded by the stance model, and weighted trends describe the whole corpus.
+3. **stance.qmd** (experimental). Set `topic`, and either a `proposition` or use the codebook's.
 4. **app/.** `shiny::runApp("app")` from the repo root. It reads its four files straight from `outputs/`.
 
 ## How paragraph units are built
@@ -40,8 +40,7 @@ The similarity threshold is a quantile rather than a fixed cosine so it means th
 | `topic_summary.csv`, `topic_trends.csv` | topics | per-topic words, prevalence, AvePP; yearly trend |
 | `topic_codebook.csv` | topics | labels, descriptions, propositions (edit by hand) |
 | `stm_fit.rds`, `searchK.rds`, `sensitivity*.{rds,csv}` | topics | model caches |
-| `paragraph_vectors.rds` | preprocess | one vector per paragraph, for stance similarity |
-| `stance_labels_NAME.csv`, `stance_trend_NAME.csv`, `stance_prompt_NAME.txt` | stance | labels, trends, the exact prompt |
+| `stance_labels_topicNN.csv`, `stance_trend_topicNN.csv`, `stance_prompt_topicNN.txt` | stance | labels, trend, the exact prompt |
 | `manifest.csv` | all | which inputs each cache was built from |
 
 `manifest.csv` records the md5 of every input a cache was built from. If an input changes, the next render stops and names the file to delete, so a stale model is never reloaded.
@@ -71,5 +70,4 @@ Scripts: tidyverse, here, viridis, stm, tidytext, splines, furrr, clue, httr2 (1
 | `Set X and Y in .Renviron` | the named variable is empty; restart R after editing .Renviron |
 | `ellmer 0.4.0 or later is needed` | update ellmer (the key is passed as `credentials`) |
 | `stm_fit.rds has K = a but tx$K = b` | delete `stm_fit.rds` |
-| stance: `no trend fitted: too few paragraphs` | under `min_class_n` on one side; raise the budget in `n` or read the shares only |
-| stance: `The claim was embedded with a different model` | the embed row differs from preprocess.qmd |
+| stance: `no trend fitted: too few paragraphs` | the class has under `min_class_n` paragraphs; read the era table only |

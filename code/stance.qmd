@@ -1,511 +1,255 @@
 ---
-title: "Stance measurement for one topic"
-subtitle: "Script 3 of 4: proposition, census classification, trend over time"
+title: "Stance on a claim over time (experimental)"
+subtitle: "Step 3 of 3. Reads preprocess.qmd outputs; does not need topics"
 format:
   typst:
     toc: false
     fig-width: 9
-    fig-height: 5.5
+    fig-height: 5
 execute:
   warning: false
   message: false
 ---
 
-```{=typst}
-#show figure: set block(breakable: true)
-```
-
-```{=html}
-<!--
-ONE TOPIC PER RENDER. Set st$topic, render, repeat for the next topic.
-Outputs are stamped with the topic number, so renders accumulate rather than
-overwrite; the codebook is appended to and reread every time.
-
-RUN ORDER
-  1. Set st$topic. Render with st$dry_run = TRUE: no API calls, prints the
-     frame size, the call and window arithmetic, and the assembled prompt.
-  2. Render with st$pilot_n = 20 to sanity-check real responses cheaply.
-  3. Set st$pilot_n = NULL and render: every paragraph in the topic is
-     classified, sleeping at each quota window. Restart-safe.
-  4. Code gold_to_code_topicNN.csv by hand, save as gold_coded_topicNN.csv,
-     re-render for validity metrics.
-
-OPENAI-COMPATIBLE ENDPOINT
-  Delete llm_openrouter.R, set st$use_openrouter = FALSE, and fill st$steps with
-  the environment-variable NAME holding each step's base URL plus its model
-  string. Keys stay in .Renviron. Nothing else changes.
-
-LAYOUT: here() is the text_mining folder, holding code/, input/, outputs/
--->
-```
-
 ```{r config}
+st <- list(
+  name = "world_role",  # short name for this claim's output files
+  proposition = "The United States should take an active role in the affairs of other nations.",
+  negation = "The United States should stay out of the affairs of other nations and avoid foreign commitments.",
+  strata = c(high = 0.05, mid = 0.20),  # top 5% by similarity, then the next 20%; the rest is low
+  n = c(high = 200L, mid = 70L, low = 30L),  # calls per stratum; unused calls roll down
+  seed = 2026L,
+  window_n = 300L,  # calls per window
+  window_wait = 60L,  # seconds between windows; 4 * 3600 for a rate-limited large model
+  df_spline = 2L,  # flexibility of the trend
+  min_class_n = 5L,  # paragraphs needed on each side for any trend
+  min_year = NULL,  # optional: fit trends from this year on
+  use_openrouter = TRUE,  # FALSE at work
+  steps = tibble::tribble(
+    ~step, ~base_url_env, ~api_key_env, ~model,
+    "embed", "COMPASS_EMBED_URL", "COMPASS_EMBED_KEY", "MODEL-FOR-EMBEDDING",
+    "stance", "COMPASS_SMALL_URL", "COMPASS_SMALL_KEY", "SMALL-MODEL"))
+
 suppressPackageStartupMessages({
   library(here); library(splines); library(viridis)
-  library(tidyverse)     # LAST so its verbs win
+  library(tidyverse)  # tidyverse last so its verbs win
 })
-# Namespaced only: ellmer (LLM calls), glue.
-
-st <- list(
-  topic = 1L,  # THE topic this render processes
-  use_openrouter = TRUE,  # FALSE to use the OpenAI-compatible endpoint
-  dry_run = FALSE,  # TRUE: build prompts, print arithmetic, stop
-  pilot_n = NULL,  # e.g. 20L to test on a subset first
-
-  # One row per pipeline step. base_url_env is the NAME of the .Renviron
-  # variable holding that step's endpoint, so different steps can point at
-  # different gateways and no URL or key appears in this file. Ignored when
-  # st$use_openrouter is TRUE, which routes through llm_openrouter.R instead.
-  steps = tibble::tribble(
-    ~step,        ~base_url_env,      ~api_key_env,       ~model,
-    "proposition", "COMPASS_LARGE_URL", "COMPASS_LARGE_KEY", "MODEL-FOR-PROPOSITIONS",
-    "stance_1",    "COMPASS_STANCE_URL","COMPASS_STANCE_KEY","MODEL-FOR-STANCE-1",
-    "stance_2",    "COMPASS_STANCE_URL","COMPASS_STANCE_KEY","MODEL-FOR-STANCE-2"),
-
-  window_n = 300L,  # calls allowed per quota window PER model
-  window_wait = 4L * 60L * 60L,  # seconds to sleep at the window boundary
-  min_theta = 0,  # scope floor: drop paragraphs whose modal topic share is
-                  # below this (0 keeps the census; raise it when AvePP is low)
-  min_class_n = 10L,  # paragraphs a stance class needs before a trend is fit
-  era_width = 5L,  # year grouping for the era table
-  df_spline = 3L,  # spline df for the trend curve
-  n_gold = 100L,  # paragraphs sent for human coding
-  rec_sizes = c(50, 100, 200, 400, 800),  # recovery-curve subsample sizes
-  rec_reps = 5L
-)
-
 theme_set(theme_minimal(base_size = 12))
-# Tables must not silently lose rows in the rendered PDF.
-options(knitr.table.max.print = Inf, knitr.kable.max_rows = Inf,
-        max.print = 1e6)
-set.seed(2026)
-
-p_out <- function(f) here::here("outputs", f)
-p_tag <- function(stem, ext = ".csv")  # topic-stamped filenames
-  p_out(str_c(stem, "_topic", sprintf("%02d", st$topic), ext))
-dir.create(here::here("outputs"), showWarnings = FALSE, recursive = TRUE)
 source(here::here("code", "llm_source.R"))
-if (isTRUE(st$use_openrouter))
+if (isTRUE(st$use_openrouter)) {
   source(here::here("code", "llm_openrouter.R"))
-if (isTRUE(st$use_openrouter))
   st$steps$model <- open_router_models[st$steps$step]
-```
-
-# Frame: every paragraph in this topic
-
-`02_topics.qmd` assigned every paragraph its modal STM topic. This script measures stance on **all** paragraphs of one topic, so there is no sampling and no sampling error: the proportions below are exact for the corpus. The budget is handled by time rather than by design, classifying `r st$window_n` paragraphs per quota window and sleeping until the reset, which makes the method portable to any corpus size without retuning a sample.
-
-```{r frame}
-#| results: asis
-paragraph_theta <- readr::read_csv(p_out("paragraph_theta.csv"),
-                                   show_col_types = FALSE)
-topic_summary   <- readr::read_csv(p_out("topic_summary.csv"),
-                                   show_col_types = FALSE)
-stopifnot("02_topics.qmd must supply modal topic and text" =
-            all(c("para_uid", "atom_id", "Year", "text", "topic",
-                  "theta_max") %in% names(paragraph_theta)))
-
-frame_all <- paragraph_theta |>
-  dplyr::filter(topic == st$topic) |>
-  dplyr::select(para_uid, atom_id, Year, n_tokens, text, theta_max)
-# Modal assignment is fuzzy when AvePP is low: a paragraph can be "in" this
-# topic at a share of 0.2 while really being about something else, and such
-# paragraphs come back irrelevant. min_theta removes them as a documented
-# scope restriction; the default of 0 keeps the full census.
-frame <- dplyr::filter(frame_all, theta_max >= st$min_theta)
-if (nrow(frame) == 0) stop("No paragraphs for topic ", st$topic,
-                           " at min_theta = ", st$min_theta, ".")
-writeLines(glue::glue("Scope: {nrow(frame)} of {nrow(frame_all)} paragraphs \
-  have a topic share of at least {st$min_theta} (median share \
-  {round(stats::median(frame_all$theta_max), 2)})."))
-
-n_windows <- ceiling(nrow(frame) / st$window_n)
-glue::glue("Topic {st$topic}: {nrow(frame)} paragraphs from \\
-            {dplyr::n_distinct(frame$atom_id)} comments across \\
-            {dplyr::n_distinct(frame$Year)} years. \\
-            {nrow(frame)} calls per model = {n_windows} quota window(s), \\
-            about {round(n_windows * st$window_wait / 3600, 1)} hours \\
-            unattended; the two raters run their windows independently.")
-```
-
-# Codebook: label, description, proposition
-
-The codebook CSV written by `02_topics.qmd` is the source of truth. Labels and descriptions come from there and are never redrafted here. The only field this script owns is the **proposition**, drafted once if the cell is empty and then left alone. All three fields enter the stance prompt, so **edit before classifying**: changing them afterward means the stored labels were produced by a different instrument. The script compares file times and warns if that has happened, and it stops by name if the topic model was refit after these labels were produced, since a refit can renumber topics.
-
-The proposition is the measurement target and must be a **contestable directional claim** ("funding for X should increase"), not a topic restatement ("this is about funding"), because a non-contestable proposition drives every paragraph to neutral and quietly destroys the measurement.
-
-```{r codebook}
-#| results: asis
-cb_path <- p_out("topic_codebook.csv")
-theta_in <- p_out("paragraph_theta.csv")
-# The codebook must describe the CURRENT fit: a refit in 02_topics.qmd can
-# renumber topics, and a stale codebook would attach labels to the wrong ones.
-check_fingerprint(cb_path, theta_in, strict = FALSE)
-if (!file.exists(cb_path))
-  stop("No topic_codebook.csv in outputs/. Render 02_topics.qmd first; it drafts ",
-       "the labels and descriptions this script needs.")
-codebook <- readr::read_csv(cb_path, show_col_types = FALSE)
-if (!st$topic %in% codebook$topic)
-  stop("Topic ", st$topic, " is not in the codebook.")
-
-# Labels and descriptions come from 02_topics.qmd and are never redrafted here.
-# Only the proposition is this script's business, and only if it is empty.
-if (is.na(codebook$proposition[codebook$topic == st$topic]) ||
-    !nzchar(str_squish(codebook$proposition[codebook$topic == st$topic] %||% ""))) {
-  row <- codebook |> dplyr::filter(topic == st$topic)
-  sys <- build_prompt(
-    role = str_c("You are a survey methodologist drafting stance items for a ",
-                 "public research program."),
-    task = str_c("From this topic's label and description, draft ONE ",
-                 "proposition that a commenter could plausibly support or ",
-                 "oppose. Before answering, test it: if a paragraph could not ",
-                 "disagree with it, rewrite it."),
-    rules = c("A proposition states a direction, not a subject.",
-              "Use only the label and description shown; invent no programs.",
-              "Keep it under 20 words and free of loaded language.",
-              "Do not restate the topic label as a proposition."),
-    output = "One proposition.")
-  schema <- ellmer::type_object(
-    proposition = ellmer::type_string("A contestable directional claim."))
-  draft <- call_one(make_chat("proposition", sys, st$steps, st$use_openrouter),
-                    str_c("Label: ", row$label,
-                          "\nDescription: ", row$description), schema)
-  if (is.null(draft)) stop("Proposition drafting call failed for topic ",
-                           st$topic, ".")
-  codebook$proposition[codebook$topic == st$topic] <- draft$proposition
-  readr::write_csv(codebook, cb_path)
-  # Stop here. The draft is unreviewed, and classifying with it would spend a
-  # full census of calls on a measurement target nobody has read. Edit the
-  # proposition, then render again; the next render finds it filled and runs.
-  writeLines(glue::glue("DRAFT proposition written for topic {st$topic}: \\
-    \"{draft$proposition}\". Review and edit it in {basename(cb_path)}, \\
-    then render again. Nothing was classified."))
-  knitr::knit_exit()
 }
-
-cb <- codebook |> dplyr::filter(topic == st$topic)
-stopifnot("codebook row must be complete" =
-            all(nzchar(c(cb$label, cb$description, cb$proposition))))
-cb |>
-  dplyr::mutate(ttl = str_c("Topic ", topic, ": ", label)) |>
-  tbl_records("ttl", c("description", "proposition"),
-              caption = "Codebook row driving this render. All three fields enter the stance prompt; the proposition is the sole measurement target.")
 ```
 
-# The instrument
+# The design
 
-Every prompt has four parts. **ROLE** frames the expertise. **TASK** states the job, gives the topic context from the codebook, and asks for a self-check. **RULES** is the anti-hallucination slot and carries the line that keeps the label from becoming a second target. **OUTPUT** states the shape and is paired with a structured schema, so an unparseable answer is impossible rather than merely discouraged. Year is deliberately withheld: telling a rater the period invites it to infer position from context rather than read it from text.
+Coding every paragraph would cost one model call each. Instead, every paragraph is scored for free by how close its meaning is to the claim, and a sample is coded: heavier where the claim is likely to appear, never zero anywhere. This is two-phase stratified sampling. Similarity is the first-phase measure and the model's label the second, and each coded paragraph carries the weight N/n of its stratum, so estimates describe the whole corpus rather than only the paragraphs that were read.
 
-```{r prompt}
+1. **Similarity.** The claim and its negation are embedded with the same model as the corpus (2 embedding calls). Each paragraph gets the higher of its two cosines, so paragraphs that argue against the claim in their own words rank as high as ones that echo it.
+2. **Strata.** Paragraphs are ranked by similarity and split into high, middle, and low strata.
+3. **Coding.** A sample from each stratum is labeled favor, neutral, oppose, or irrelevant, one call per paragraph. The low stratum doubles as the audit of what the similarity screen misses.
+
+**Claim:** `r st$proposition`
+
+**Negation used for scoring:** `r st$negation`
+
+```{r similarity}
 #| results: asis
-stance_labels <- c("favor", "neutral", "oppose", "irrelevant")
-stance_schema <- ellmer::type_object(
-  label = ellmer::type_enum(stance_labels, "The single best-fitting label."))
+para_in <- p_out(c("paragraphs.csv", "paragraph_vectors.rds"))
+paras <- readr::read_csv(para_in[1], show_col_types = FALSE)
+V <- readRDS(para_in[2])[paras$para_uid, , drop = FALSE]
+q <- embed_texts(c(st$proposition, st$negation), st$steps, st$use_openrouter)
+if (ncol(q) != ncol(V))
+  stop("The claim was embedded with a different model than the corpus. ",
+       "Use the same embed row as preprocess.qmd.")
+unit <- function(m) m / sqrt(rowSums(m^2))
+sims <- unit(V) %*% t(unit(q))
+paras <- paras |>
+  dplyr::mutate(sim = pmax(sims[, 1], sims[, 2]),
+                pct = dplyr::percent_rank(dplyr::desc(sim)),
+                stratum = dplyr::case_when(
+                  pct < st$strata[["high"]] ~ "high",
+                  pct < st$strata[["high"]] + st$strata[["mid"]] ~ "mid",
+                  TRUE ~ "low"))
+writeLines(glue::glue("{nrow(paras)} paragraphs from \\
+  {dplyr::n_distinct(paras$atom_id)} comments scored against the claim."))
+```
 
-stance_sys <- build_prompt(
-  role = str_c("You are a survey methodologist coding stance in public ",
-               "comments for a research program."),
-  task = str_c("These paragraphs were grouped under the topic \"", cb$label,
-               "\": ", cb$description, " Decide the author's position toward ",
-               "this proposition: \"", cb$proposition, "\". First check ",
-               "whether the text addresses the proposition at all; if it ",
-               "does not, the label is irrelevant. Then decide favor, ",
-               "oppose, or neutral."),
-  rules = c(str_c("Stance is measured ONLY toward the proposition. The topic ",
-                  "label and description are context for judging relevance, ",
-                  "not a second target."),
+```{r sample}
+#| results: asis
+# A stratum smaller than its allocation is coded in full and its unused
+# calls roll down to the next stratum (high, then mid, then low), so the
+# whole budget is spent.
+N <- table(factor(paras$stratum, levels = c("high", "mid", "low")))
+alloc <- purrr::reduce(c("high", "mid", "low"), function(acc, h) {
+  want <- st$n[[h]] + acc$spare
+  take <- min(N[[h]], want)
+  list(n = c(acc$n, stats::setNames(take, h)), spare = want - take)
+}, .init = list(n = integer(), spare = 0))$n
+sampled <- paras |>
+  dplyr::group_split(stratum) |>
+  purrr::map(function(d) {
+    n_h <- alloc[[d$stratum[1]]]
+    i <- withr::with_seed(st$seed, sample.int(nrow(d), n_h))
+    dplyr::mutate(d[sort(i), ], N_h = nrow(d), n_h = n_h, w = N_h / n_h)
+  }) |>
+  purrr::list_rbind()
+sampled |>
+  dplyr::group_by(stratum) |>
+  dplyr::summarise(paragraphs = dplyr::first(N_h), coded = dplyr::first(n_h),
+                   weight = round(dplyr::first(w), 1)) |>
+  dplyr::left_join(paras |>
+                     dplyr::group_by(stratum) |>
+                     dplyr::summarise(similarity = str_c(round(min(sim), 2), " to ",
+                                                         round(max(sim), 2))),
+                   by = "stratum") |>
+  dplyr::arrange(match(stratum, c("high", "mid", "low"))) |>
+  dplyr::select(stratum, similarity, paragraphs, coded, weight) |>
+  tbl_paged(caption = "Strata. Each coded paragraph stands for `weight` paragraphs of its stratum.")
+```
+
+# Coding
+
+One paragraph per call, at temperature 0, without the year. Labels are saved per paragraph after every window of `r st$window_n` calls, so an interrupted run resumes where it stopped, and a changed sample only sends paragraphs not yet coded. Changing the claim's wording refuses the saved labels and names the file to delete.
+
+```{r classify}
+#| results: asis
+labels_path <- p_out(str_c("stance_labels_", st$name, ".csv"))
+prompt_path <- p_out(str_c("stance_prompt_", st$name, ".txt"))
+sys <- build_prompt(
+  role = "You are a survey methodologist coding stance in public comments.",
+  task = str_c("Decide the author's position toward this proposition: \"", st$proposition,
+               "\". First decide whether the text addresses the proposition at all; ",
+               "if not, the label is irrelevant. Otherwise decide favor, oppose, or neutral."),
+  rules = c("Stance is measured only toward the proposition.",
             "Stance is not tone: an angry passage can favor the proposition.",
             "Judge only the text shown; use no outside knowledge.",
             "If the text is ambiguous, choose neutral rather than guessing."),
   output = "One label: favor, neutral, oppose, or irrelevant.")
+writeLines(sys, prompt_path)
+check_inputs(labels_path, c(para_in[1], prompt_path))
 
-writeLines(c("```", stance_sys, "```"))
+done <- if (file.exists(labels_path))
+  readr::read_csv(labels_path, show_col_types = FALSE, col_types = "cc") else
+  tibble(para_uid = character(), label = character())
+todo <- dplyr::anti_join(sampled, done, by = "para_uid")
+windows <- split(todo, ceiling(seq_len(nrow(todo)) / st$window_n))
+type <- ellmer::type_object(label = ellmer::type_enum(
+  c("favor", "neutral", "oppose", "irrelevant"), "The single best label."))
+
+done <- purrr::reduce(seq_along(windows), function(done, i) {
+  if (i > 1) purrr::walk(seq_len(st$window_wait), function(s) Sys.sleep(1),
+                         .progress = glue::glue("resting {st$window_wait}s"))
+  d <- windows[[i]]
+  message(glue::glue("window {i} of {length(windows)}: {nrow(d)} calls"))
+  res <- ask_many(make_chat("stance", sys, st$steps, st$use_openrouter),
+                  str_c("Text: ", d$text), type, rpm = st$window_n)
+  if (all(is.na(res$label)))
+    stop("Every call in the window failed. First error: ",
+         conditionMessage(purrr::compact(res$.error)[[1]]))
+  out <- dplyr::bind_rows(done, tibble(para_uid = d$para_uid,
+                                       label = as.character(res$label))) |>
+    dplyr::filter(!is.na(label))
+  readr::write_csv(out, labels_path)
+  record_inputs(labels_path, c(para_in[1], prompt_path))
+  out
+}, .init = done)
+
+coded <- dplyr::inner_join(sampled, done, by = "para_uid")
+if (nrow(coded) < nrow(sampled))
+  writeLines(glue::glue("**{nrow(sampled) - nrow(coded)} calls failed;** re-render to retry them."))
+coded |>
+  dplyr::count(stratum, label) |>
+  tidyr::pivot_wider(names_from = label, values_from = n, values_fill = 0) |>
+  dplyr::left_join(coded |>
+                     dplyr::group_by(stratum) |>
+                     dplyr::summarise(relevant_share = round(mean(label != "irrelevant"), 2),
+                                      weight = round(dplyr::first(w), 1)),
+                   by = "stratum") |>
+  dplyr::arrange(match(stratum, c("high", "mid", "low"))) |>
+  tbl_paged(caption = "Labels by stratum (counts). relevant_share in the low stratum is the audit: how often the similarity screen ranked a relevant paragraph low. Each of those stands for `weight` paragraphs, so a high value there widens every interval.")
 ```
 
-# Classification
+# What the labels look like
 
-Sequential, one paragraph per call: items sharing a context bleed into each other, and stance is where that matters most. Two raters, each with its own quota, classified in blocks of `r st$window_n` with a sleep at the window boundary. The label store is **incremental**, so an interrupted render, a crash, or a rerun re-sends only what is missing; a temperature-0 label is a fixed measurement of a fixed paragraph.
-
-```{r classify}
-todo_all <- if (is.null(st$pilot_n)) frame else
-  dplyr::slice_head(frame, n = st$pilot_n)
-
-if (isTRUE(st$dry_run)) {
-  glue::glue("DRY RUN: {nrow(todo_all)} paragraphs x \\
-              {sum(str_detect(st$steps$step, '^stance'))} raters = \\
-              {nrow(todo_all) * sum(str_detect(st$steps$step, '^stance'))} \\
-              calls. No requests made. Set st$dry_run = FALSE to run.")
-  knitr::knit_exit()
-}
-
-store_path <- p_tag("stance_labels")
-# Stored labels belong to the paragraphs of THIS fit's topic. If 02_topics.qmd
-# refit and theta changed, the topic's membership may have changed too.
-check_fingerprint(store_path, theta_in)
-store <- if (file.exists(store_path))
-  readr::read_csv(store_path, show_col_types = FALSE) else
-  tibble(para_uid = character(), rater = character(), label = character())
-
-if (file.exists(store_path) &&
-    file.mtime(cb_path) > file.mtime(store_path))
-  warning("The codebook was edited after these labels were produced. The ",
-          "stored labels came from a different prompt; delete ",
-          basename(store_path), " and reclassify.")
-
-raters <- st$steps |> dplyr::filter(str_detect(step, "^stance"))
-new <- purrr::map(raters$step, function(r) {
-  todo <- todo_all |>
-    dplyr::anti_join(dplyr::filter(store, rater == r), by = "para_uid")
-  if (nrow(todo) == 0) return(NULL)
-  chat <- make_chat(r, stance_sys, st$steps, st$use_openrouter)
-  classify_census(chat, str_c("Text: ", todo$text), todo$para_uid,
-                  stance_schema, st$window_n, st$window_wait) |>
-    dplyr::transmute(para_uid = id, rater = r, label)
-}) |> purrr::list_rbind()
-
-store <- dplyr::bind_rows(store, new) |>
-  dplyr::distinct(para_uid, rater, .keep_all = TRUE)
-readr::write_csv(store, store_path)
-write_fingerprint(store_path, theta_in)
-glue::glue("{dplyr::n_distinct(store$para_uid)} paragraphs labeled by \\
-            {dplyr::n_distinct(store$rater)} raters; {nrow(new)} new this \\
-            render; {sum(is.na(store$label))} unresolved (re-render to retry).")
-```
-
-# Reliability
-
-Agreement between raters is reliability, not accuracy: both can be wrong together. Kappa is reported with raw agreement and the confusion table, because kappa alone has no validated interpretive thresholds.
-
-The overall figure mixes two different judgments, and they fail for different reasons. **Relevance** asks whether a paragraph addresses the proposition at all; it depends on how the proposition is worded and how broadly each model reads it. **Direction** asks which side a paragraph takes, among paragraphs both raters agree are relevant. When relevance agreement is low but direction agreement is high, the models read positions consistently and disagree only about scope, and the fix is a sharper proposition or a stricter scope floor, not different models.
-
-```{r reliability}
+```{r examples}
 #| results: asis
-wide <- store |> dplyr::filter(!is.na(label)) |>
-  tidyr::pivot_wider(names_from = rater, values_from = label)
-r1 <- wide[[2]]; r2 <- wide[[3]]
-ag  <- agreement(r1, r2, dnn = names(wide)[2:3])
-rel_ag <- agreement(r1 != "irrelevant", r2 != "irrelevant",
-                    dnn = str_c(names(wide)[2:3], " relevant"))
-both <- r1 != "irrelevant" & r2 != "irrelevant"
-dir_ag <- if (sum(both) > 1) agreement(r1[both], r2[both],
-                                       dnn = names(wide)[2:3]) else NULL
-tibble::tibble(
-  judgment = c("overall (four labels)", "relevance (relevant or not)",
-               "direction (both raters call it relevant)"),
-  paragraphs = c(ag$n, rel_ag$n, dir_ag$n %||% sum(both)),
-  kappa = round(c(ag$kappa, rel_ag$kappa, dir_ag$kappa %||% NA), 3),
-  raw_agreement = round(c(ag$raw, rel_ag$raw, dir_ag$raw %||% NA), 3)) |>
-  tbl_paged(caption = "Rater agreement, split into relevance and direction. Low relevance agreement with high direction agreement points at the proposition's wording, not at the models.")
-writeLines(glue::glue("Paragraphs judged relevant: {names(wide)[2]} \\
-  {sum(r1 != 'irrelevant')}, {names(wide)[3]} {sum(r2 != 'irrelevant')}, \\
-  both {sum(both)}, of {length(r1)}."))
-```
-
-```{r confusion}
-ag$confusion
-```
-
-# Human coding
-
-The only thing that turns "the raters agreed" into "the raters were right". The coding file shows the coder the same label, description, and proposition the rater saw, and no model output, so the comparison is not anchored.
-
-```{r gold}
-#| results: asis
-gold_out <- p_tag("gold_to_code")
-frame |>
-  dplyr::slice_sample(n = min(st$n_gold, nrow(frame))) |>
-  dplyr::transmute(para_uid, topic = st$topic, topic_label = cb$label,
-                   topic_description = cb$description,
-                   proposition = cb$proposition, text,
-                   human_label = NA_character_, coder_notes = NA_character_) |>
-  readr::write_csv(gold_out)
-
-gold_in <- p_tag("gold_coded")
-if (file.exists(gold_in)) {
-  gold <- readr::read_csv(gold_in, show_col_types = FALSE)
-  purrr::walk(unique(store$rater), function(r) {
-    j <- store |> dplyr::filter(rater == r) |>
-      dplyr::inner_join(dplyr::select(gold, para_uid, human_label),
-                        by = "para_uid")
-    m <- class_metrics(j$label, j$human_label)
-    k <- agreement(j$label, j$human_label, dnn = c(r, "human"))
-    print(glue::glue("[{r}] macro-F1 {round(m$macro_f1, 3)}, accuracy \\
-                      {round(m$accuracy, 3)}, kappa vs human \\
-                      {round(k$kappa, 3)}"))
-    tbl_paged(m$per_class, caption = str_c("Per-class validity, ", r))
-  })
-} else {
-  glue::glue("No coded file yet. Code {basename(gold_out)}, save it as \\
-              {basename(gold_in)} with human_label filled, and re-render. \\
-              Until then the stance labels are unvalidated.")
-}
+coded |>
+  dplyr::group_by(label) |>
+  dplyr::slice_max(sim, n = 3, with_ties = FALSE) |>
+  dplyr::ungroup() |>
+  dplyr::mutate(title = str_c(toupper(label), " | ", Year, " | ", para_uid),
+                text = str_trunc(text, 350)) |>
+  tbl_records("title", "text",
+              caption = "The three paragraphs most similar to the claim for each label. If these do not match what the label should mean, fix the claim before reading any number.")
 ```
 
 # Results
 
-Estimates are shown for **both raters side by side**. The raters can disagree systematically, most often about whether a paragraph addresses the proposition at all, and a result that holds for one rater but not the other depends on the choice of model rather than on the text. Reading the two together makes that visible instead of hiding it behind whichever model happens to be listed first.
+All shares are weighted to the whole corpus, with 95 percent intervals clustered by comment.
 
-```{r estimates}
+```{r overall}
 #| results: asis
-# Eras are anchored to round years (1850-1854, 1855-1859, ...) so bins are
-# comparable across topics, whatever year a topic first appears.
-est <- frame |>
-  dplyr::inner_join(dplyr::filter(store, !is.na(label)), by = "para_uid") |>
-  dplyr::mutate(
-    era_start = floor(Year / st$era_width) * st$era_width,
-    era = str_c(era_start, "-", era_start + st$era_width - 1L))
-
-est |>
-  dplyr::count(rater, era_start, era, label) |>
-  dplyr::group_by(rater, era) |>
-  dplyr::mutate(p = round(n / sum(n), 3)) |>
-  dplyr::ungroup() |>
-  tidyr::pivot_wider(id_cols = c(era_start, era, rater), names_from = label,
-                     values_from = p, values_fill = 0) |>
-  dplyr::arrange(era_start, rater) |>
-  dplyr::select(-era_start) |>
-  tbl_paged(caption = "Stance proportions by era and rater. Every paragraph in the topic was classified, so these are exact for the corpus and carry no sampling error; the live uncertainty is rater misclassification, quantified by the human-coded metrics above.")
+rel <- dplyr::filter(coded, label != "irrelevant")
+sided <- dplyr::filter(rel, label %in% c("favor", "oppose"))
+dplyr::bind_rows(
+  dplyr::mutate(share_ci(coded$label != "irrelevant", coded$atom_id, coded$w),
+                measure = "paragraphs addressing the claim", coded = nrow(coded)),
+  dplyr::mutate(share_ci(rel$label == "favor", rel$atom_id, rel$w),
+                measure = "favor, of those addressing it", coded = nrow(rel)),
+  dplyr::mutate(share_ci(rel$label == "neutral", rel$atom_id, rel$w),
+                measure = "neutral, of those addressing it", coded = nrow(rel)),
+  dplyr::mutate(share_ci(sided$label == "favor", sided$atom_id, sided$w),
+                measure = "favor, of those taking a side", coded = nrow(sided))) |>
+  dplyr::select(measure, coded, share, lo, hi) |>
+  tbl_paged(caption = "Weighted shares for the whole corpus.")
 ```
 
-The trend panels are a different kind of statement. They treat the corpus as one realization of a comment-generating process, so each interval is model-based, not design-based, with cluster-robust standard errors on the comment because paragraphs from one author are correlated. The exact era proportions above need no interval; the curves do, and the two should not be mixed in a single sentence.
+Two lines over time. **Stance** is the share of paragraphs addressing the claim that favor it. **Attention** is the share of all paragraphs that address the claim at all. Read together, they separate a change in opinion from a change in how often the claim comes up.
 
-A curve is drawn only where the data can support one. A stance class needs at least `r st$min_class_n` paragraphs in it and `r st$min_class_n` outside it among the relevant paragraphs, spread over more years than the spline has degrees of freedom, and the fit must not *separate*: if every relevant paragraph after some year carries the same label, the logistic curve pins to 0 or 1 and its interval fills the whole panel, which is an artifact rather than an estimate. Classes that fail show their observed yearly shares only, and the table below says why.
-
-```{r trend}
-#| fig-cap: "Share of relevant paragraphs in each stance, by rater and year. Lines are cluster-robust spline fits with 95 percent intervals, drawn only where the class has enough support and does not separate; points are the observed yearly shares, shown in every panel."
-#| fig-height: 5.5
+```{r trends}
 #| results: asis
-rel <- dplyr::filter(est, label != "irrelevant")
-stances <- c("favor", "neutral", "oppose")
-grid <- tidyr::expand_grid(rater = unique(rel$rater), stance = stances)
-
-# One fit per rater and stance; every outcome is recorded with its reason.
-fits <- purrr::pmap(grid, function(rater, stance) {
-  d <- rel |> dplyr::filter(.data$rater == !!rater) |>
-    dplyr::mutate(y = as.integer(label == stance))
-  why <- class_support(d$y, d$Year, st$df_spline, st$min_class_n)
-  out <- if (is.null(why)) tryCatch(trend_curve(d, "y", "atom_id", st$df_spline),
-                                    error = function(e) conditionMessage(e))
-  list(rater = rater, stance = stance, n = sum(d$y), n_rel = nrow(d),
-       curve = if (is.data.frame(out)) out,
-       status = if (is.data.frame(out)) "fitted" else (why %||% out))
-})
-support <- purrr::map(fits, ~ tibble::tibble(rater = .x$rater, stance = .x$stance,
-  paragraphs = .x$n, relevant = .x$n_rel, result = as.character(.x$status))) |>
-  purrr::list_rbind()
-tbl_paged(support, caption = "Trend support by rater and stance: fitted, or the reason no curve is drawn.")
-
-tr <- purrr::keep(fits, ~ !is.null(.x$curve)) |>
-  purrr::map(~ dplyr::mutate(.x$curve, rater = .x$rater, stance = .x$stance)) |>
-  purrr::list_rbind() %||% tibble::tibble()  # empty when no class supports a fit
-if (nrow(tr)) readr::write_csv(tr, p_tag("stance_trend"))
-
-obs <- rel |>
-  dplyr::count(rater, Year, label) |>
-  dplyr::group_by(rater, Year) |>
-  dplyr::mutate(share = n / sum(n)) |>
-  dplyr::ungroup() |>
-  dplyr::filter(label %in% stances) |>
-  dplyr::mutate(stance = factor(label, levels = stances))
-
-p <- ggplot(mapping = aes(Year)) +
-  geom_point(data = obs, aes(y = share, color = stance), alpha = .5, size = 1) +
-  facet_grid(rater ~ stance, drop = FALSE) +
-  scale_color_viridis_d(end = .85, drop = FALSE, guide = "none") +
-  scale_fill_viridis_d(end = .85, drop = FALSE, guide = "none") +
-  scale_y_continuous(limits = c(0, 1)) +
-  labs(x = NULL, y = "share of relevant paragraphs", title = cb$label,
-       subtitle = glue::glue("Relevant paragraphs: {str_c(names(table(rel$rater)), ' ', table(rel$rater), collapse = ', ')} of {nrow(frame)}"))
-if (nrow(tr))
-  p <- p +
-    geom_ribbon(data = dplyr::mutate(tr, stance = factor(stance, levels = stances)),
-                aes(ymin = lo, ymax = hi, fill = stance), alpha = .2) +
-    geom_line(data = dplyr::mutate(tr, stance = factor(stance, levels = stances)),
-              aes(y = fit, color = stance), linewidth = .8)
-print(p)
-```
-
-# How many paragraphs would have sufficed?
-
-Because the topic was censused, this costs nothing: subsample the labeled paragraphs at increasing sizes, refit the trend, and measure how far each fitted curve sits from the full-census curve. Comments are subsampled rather than paragraphs, so each replicate has the clustered shape a real collection would have. The curve is computed for the fitted stance class with the most support, preferring the first rater and falling back to the second when the first has no fitted class. Small subsamples often separate even when the census does not; those replicates are skipped, and the count kept is reported. If no class supports a census curve, there is nothing to recover and the section says so.
-
-```{r recovery}
-#| results: asis
-# Prefer the first rater, but fall back to any rater with a fitted class:
-# recovery is about sample size, and either rater's labels can show it.
-rec_class <- support |>
-  dplyr::filter(result == "fitted") |>
-  dplyr::arrange(rater != raters$step[1], dplyr::desc(paragraphs)) |>
-  dplyr::slice_head(n = 1)
-rec <- if (nrow(rec_class) == 0) NULL else {
-  d <- rel |> dplyr::filter(rater == rec_class$rater) |>
-    dplyr::mutate(y = as.integer(label == rec_class$stance))
-  recovery_curve(d, "y", st$rec_sizes[st$rec_sizes < nrow(d)],
-                 st$rec_reps, st$df_spline)
+from <- st$min_year %||% min(coded$Year)
+fit_one <- function(d, y, what) {
+  d <- dplyr::filter(d, Year >= from)
+  r <- tryCatch(trend_curve(y(d), d$Year, d$atom_id, st$df_spline,
+                            st$min_class_n, d$w),
+                error = function(e) conditionMessage(e))
+  if (is.character(r)) {
+    writeLines(glue::glue("**{what}: no trend fitted:** {r}."))
+    return(NULL)
+  }
+  if (r$df[1] == 1L) writeLines(glue::glue("{what}: fewer than 10 paragraphs on one side, so a straight line in year."))
+  dplyr::mutate(r, line = what)
 }
-if (is.null(rec) || nrow(rec) == 0) {
-  writeLines("No stance class supports a census trend for this topic, so there is no curve to recover. Improve the proposition or raise the scope floor first.")
-} else {
-  readr::write_csv(rec, p_tag("recovery_curve"))
-  writeLines(glue::glue("Recovery of the '{rec_class$stance}' curve \\
-    ({rec_class$rater}, {rec_class$paragraphs} paragraphs); {nrow(rec)} of \\
-    {length(st$rec_sizes[st$rec_sizes < nrow(d)]) * st$rec_reps} replicates \\
-    could be fitted."))
-  print(ggplot(rec, aes(n_actual, mad)) +
-    geom_point(alpha = 0.5, color = viridis(1, begin = 0.35)) +
-    labs(x = "paragraphs classified", y = "mean absolute deviation from census",
-         title = "Deviation from the census trend by subsample size"))
-}
+rug <- dplyr::bind_rows(
+  dplyr::transmute(dplyr::filter(rel, Year >= from), Year,
+                   line = "stance: favor, of those addressing the claim"),
+  dplyr::transmute(dplyr::filter(coded, Year >= from), Year,
+                   line = "attention: share addressing the claim"))
+trends <- dplyr::bind_rows(
+  fit_one(rel, function(d) as.integer(d$label == "favor"),
+          "stance: favor, of those addressing the claim"),
+  fit_one(coded, function(d) as.integer(d$label != "irrelevant"),
+          "attention: share addressing the claim"))
+if (nrow(trends)) readr::write_csv(trends, p_out(str_c("stance_trend_", st$name, ".csv")))
 ```
 
-# Documentation
-
-```{r data-dict}
-emit_data_dict(
-  path = p_tag("data-dict", ".yaml"),
-  name = str_c("stance_topic_", st$topic),
-  description = str_c("Census stance measurement for STM topic ", st$topic,
-                      " (", cb$label, ")."),
-  tables = list(
-    list(name = "topic_codebook", path = cb_path, data = codebook,
-         description = "Label, description, and proposition per topic. Analyst-edited; all three enter the stance prompt.",
-         vars = list(topic = "STM topic number", label = "Short human-readable name",
-                     description = "One factual sentence about the topic",
-                     proposition = "The contestable claim stance is measured toward")),
-    list(name = "stance_labels", path = store_path, data = store,
-         description = "One row per paragraph per rater; the incremental label store.",
-         vars = list(para_uid = "Paragraph id", rater = "Pipeline step that produced the label",
-                     label = "favor, neutral, oppose, or irrelevant")),
-    list(name = "stance_trend", path = p_tag("stance_trend"), data = tr,
-         description = "Fitted share of relevant paragraphs in each supported stance class, by rater and year, with cluster-robust intervals.",
-         vars = list(Year = "Calendar year", fit = "Fitted probability",
-                     lo = "Lower 95% bound", hi = "Upper 95% bound",
-                      se_ratio = "Robust/naive SE ratio; the clustering cost",
-                     rater = "Pipeline step that produced the labels",
-                     stance = "Which stance this curve estimates")),
-    list(name = "recovery_curve", path = p_tag("recovery_curve"),
-         data = rec %||% tibble::tibble(),
-         description = "Deviation from the census trend by subsample size.",
-         vars = list(n_target = "Requested subsample size", rep = "Replicate index",
-                     n_actual = "Paragraphs actually drawn", mad = "Mean absolute deviation"))),
-  glossary = list(
-    stance = "Position toward a stated proposition (favor, neutral, oppose) or irrelevant; distinct from sentiment.",
-    proposition = "The contestable claim stance is measured toward; analyst-authored.",
-    census = "Every paragraph in the topic was classified, so proportions are exact and carry no sampling error.",
-    `cluster-robust` = "Standard errors allowing correlation among paragraphs from the same comment.",
-    `recovery curve` = "Post-hoc subsampling of the census showing how quickly the trend estimate stabilizes."))
-
-glue::glue("Wrote: {basename(store_path)}, {basename(p_tag('stance_trend'))}, \\
-            {basename(p_tag('recovery_curve'))}, {basename(gold_out)}, \\
-            {basename(p_tag('data-dict', '.yaml'))}. Raters: \\
-            {str_c(raters$model, collapse = ' | ')}; temperature 0; \\
-            run {format(Sys.Date())}.")
+```{r trend-plot}
+#| fig-height: 6
+#| fig-cap: "Weighted trends with 95 percent intervals clustered by comment. Ticks along the bottom mark the coded paragraphs behind each line; where they are sparse, the line is mostly the model's smoothing. The intervals do not include error in the model's labels."
+if (nrow(trends))
+  ggplot(trends, aes(Year, fit)) +
+    geom_ribbon(aes(ymin = lo, ymax = hi), alpha = 0.2, fill = viridis(1, begin = 0.35)) +
+    geom_line(linewidth = 0.9, color = viridis(1, begin = 0.35)) +
+    geom_rug(data = dplyr::semi_join(rug, trends, by = "line"), aes(Year),
+             inherit.aes = FALSE, alpha = 0.4, length = grid::unit(0.03, "npc")) +
+    facet_wrap(~ line, ncol = 1, scales = "free_y") +
+    scale_y_continuous(labels = function(x) str_c(round(100 * x), "%")) +
+    labs(x = NULL, y = NULL)
 ```
 
-# Limitations
+# Before using these numbers
 
-1. **Exact does not mean correct.** A census removes sampling error, not measurement error. Rater misclassification is the live uncertainty and only the human-coded metrics speak to it.
-2. **Modal topic assignment carries error.** Topics are model-derived domains; a paragraph near the boundary between two topics is assigned as confidently as one at the center.
-3. **Two framings, one document.** Era proportions are exact for this corpus; the trend interval is a superpopulation statement. Do not combine them in one claim.
-4. **Agreement is not accuracy.** Two raters agreeing shows reliability, and both can be wrong in the same direction.
-5. **The instrument includes the codebook.** Label, description, and proposition are in the prompt, so editing them after a run invalidates the stored labels; the script warns, but the discipline is yours.
+This step is experimental. Labels come from one model with no human check, so their error is not in the intervals. Relevant paragraphs found in the low stratum carry large weights and widen the intervals; if many turn up there, move budget from the high stratum to the middle. Every share is a share of paragraphs, so a long comment counts more than a short one.
