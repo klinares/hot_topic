@@ -1,0 +1,265 @@
+---
+title: "UNGA speeches: topics and how they change over time"
+subtitle: "Step 1 of 2. Then stance.R"
+format:
+  typst:
+    toc: false
+    fig-width: 9
+    fig-height: 5.5
+execute:
+  warning: false
+  message: false
+---
+
+```{r config}
+tx <- list(
+  input_file = "unga.parquet",  # in unga/input/: id, para_id, year, country, raw_text
+  seed = 2026L,
+  min_docfreq = 5L,  # drop words in fewer paragraphs than this
+  drop_words = c("united", "nations", "general", "assembly", "session",
+                 "president", "mr", "secretary", "delegation"),  # in every speech
+  run_searchK = FALSE,  # TRUE once to choose K (slow)
+  K_grid = seq(10, 40, 5),
+  K = 20L,  # set from the searchK plots
+  spline_df = 5L,  # flexibility of the year trend
+  n_words = 20L,  # words per topic shown to the codebook model
+  n_examples = 5L,  # example paragraphs per topic shown to the codebook model
+  n_draws = 25L,  # draws of topic shares behind each trend interval
+  workers = 8L,
+  use_openrouter = TRUE,  # FALSE at work
+  steps = tibble::tribble(
+    ~step, ~base_url_env, ~api_key_env, ~model,
+    "codebook", "COMPASS_LARGE_URL", "COMPASS_LARGE_KEY", "LARGE-MODEL"))
+
+suppressPackageStartupMessages({
+  library(here); library(stm); library(splines); library(viridis)
+  library(tidyverse)  # tidyverse last so its verbs win
+})
+theme_set(theme_minimal(base_size = 12))
+set.seed(tx$seed)
+source(here::here("unga", "code", "unga_source.R"))
+if (isTRUE(tx$use_openrouter)) {
+  source(here::here("unga", "code", "unga_openrouter.R"))
+  tx$steps$model <- open_router_models[tx$steps$step]
+}
+dir.create(p_out(), showWarnings = FALSE)
+```
+
+# Input
+
+Each row is one paragraph of one speech. `id` identifies the speech, `para_id` the paragraph within it.
+
+```{r input}
+#| results: asis
+raw_in <- p_in(tx$input_file)
+raw <- arrow::read_parquet(raw_in)
+miss <- setdiff(c("id", "para_id", "year", "country", "raw_text"), names(raw))
+if (length(miss)) stop(tx$input_file, " is missing: ", str_c(miss, collapse = ", "))
+paragraphs <- raw |>
+  dplyr::transmute(para_uid = str_c(id, "-", para_id), id = as.character(id),
+                   para_id, year = as.integer(year), country,
+                   text = str_squish(raw_text)) |>
+  dplyr::filter(!is.na(year), !is.na(country), !is.na(text), text != "")
+stopifnot("id + para_id must be unique" = !anyDuplicated(paragraphs$para_uid),
+          "a speech id must have one country and one year" =
+            nrow(dplyr::distinct(paragraphs, id, country, year)) ==
+            dplyr::n_distinct(paragraphs$id))
+writeLines(glue::glue("Kept {nrow(paragraphs)} of {nrow(raw)} paragraphs from \\
+  {dplyr::n_distinct(paragraphs$id)} speeches by \\
+  {dplyr::n_distinct(paragraphs$country)} countries, \\
+  {min(paragraphs$year)} to {max(paragraphs$year)}."))
+```
+
+```{r coverage}
+#| fig-height: 3.5
+#| fig-cap: "Countries with a speech in each year. Not every country speaks every year; country is kept in the outputs but is not in the topic model."
+paragraphs |>
+  dplyr::distinct(year, country) |>
+  dplyr::count(year) |>
+  ggplot(aes(year, n)) +
+  geom_col(fill = viridis(1, begin = 0.35)) +
+  labs(x = NULL, y = "countries")
+```
+
+# Document-term matrix
+
+Words are lowercased and kept only if purely alphabetic. Stopwords, month and weekday names, and the boilerplate in `drop_words` are removed. Words in fewer than `r tx$min_docfreq` paragraphs are dropped.
+
+```{r dtm}
+tokens <- clean_tokens(paragraphs, tx$drop_words)
+stm_in <- stm_input(tokens, tx$min_docfreq)
+# stm needs a plain data frame in the same row order as the documents, with
+# the year spline as ordinary columns yr1, yr2, ...
+meta <- tibble(para_uid = names(stm_in$documents)) |>
+  dplyr::left_join(paragraphs, by = "para_uid") |>
+  as.data.frame()
+bs <- splines::ns(meta$year, df = tx$spline_df)
+colnames(bs) <- str_c("yr", seq_len(ncol(bs)))
+meta <- cbind(meta, as.data.frame(bs))
+prev_form <- as.formula(str_c("~ ", str_c(colnames(bs), collapse = " + ")))
+glue::glue("{length(stm_in$documents)} paragraphs, {length(stm_in$vocab)} words; \\
+  {nrow(paragraphs) - length(stm_in$documents)} paragraphs had no word left.")
+```
+
+# Choosing K
+
+Take the smallest K where held-out likelihood has flattened and residual dispersion has stopped falling, then break ties on coherence and exclusivity. If the best values sit at the edge of the grid, widen it.
+
+```{r searchK}
+if (isTRUE(tx$run_searchK)) {
+  future::plan(future::multisession, workers = tx$workers)
+  ho <- stm::make.heldout(stm_in$documents, stm_in$vocab, seed = tx$seed)
+  metrics <- cached(p_out("searchK.rds"), raw_in,
+    furrr::future_map(tx$K_grid, function(k) {
+      fit <- stm::stm(ho$documents, ho$vocab, K = k, init.type = "Spectral",
+                      prevalence = prev_form, data = meta, verbose = FALSE)
+      tibble(K = k,
+             heldout = stm::eval.heldout(fit, ho$missing)$expected.heldout,
+             dispersion = stm::checkResiduals(fit, ho$documents)$dispersion,
+             coherence = mean(stm::semanticCoherence(fit, ho$documents)),
+             exclusivity = mean(stm::exclusivity(fit)))
+    }, .options = furrr::furrr_options(seed = tx$seed)) |> purrr::list_rbind())
+  future::plan(future::sequential)
+  metrics |>
+    tidyr::pivot_longer(-K) |>
+    ggplot(aes(K, value)) +
+    geom_line(color = viridis(1, begin = 0.35)) + geom_point() +
+    facet_wrap(~ name, scales = "free_y") + labs(y = NULL)
+} else glue::glue("searchK skipped; K = {tx$K}")
+```
+
+# Structural topic model
+
+Year enters topic prevalence as a spline, so each topic's share can rise and fall over the period. Country is not in the model; it rides along in the outputs for filtering. Spectral initialization makes the fit reproducible.
+
+```{r stm-fit}
+stm_fit <- cached(p_out("stm_fit.rds"), raw_in,
+  stm::stm(stm_in$documents, stm_in$vocab, K = tx$K, init.type = "Spectral",
+           prevalence = prev_form, data = meta, verbose = FALSE))
+K <- ncol(stm_fit$theta)
+if (K != tx$K) stop("stm_fit.rds has K = ", K, " but tx$K = ", tx$K,
+                    ". Delete stm_fit.rds, then re-render.")
+theta <- stm_fit$theta
+colnames(theta) <- str_c("topic_", seq_len(K))
+```
+
+# Assigning paragraphs to topics
+
+Each paragraph is assigned its most likely topic. **Entropy R²** (0 to 1) says how sharply paragraphs sort into topics overall; **AvePP** is the average topic share among a topic's own paragraphs, with about 0.7 the usual floor.
+
+```{r modal}
+#| results: asis
+paragraph_theta <- meta |>
+  dplyr::select(para_uid, id, para_id, year, country, text) |>
+  dplyr::bind_cols(tibble::as_tibble(theta)) |>
+  dplyr::mutate(topic = max.col(theta, ties.method = "first"),
+                theta_max = theta[cbind(dplyr::row_number(), topic)])
+entropy_r2 <- 1 - (-sum(theta * log(theta + 1e-12))) / (nrow(theta) * log(K))
+
+words <- stm::labelTopics(stm_fit, n = tx$n_words)
+topic_summary <- tibble(
+  topic = seq_len(K),
+  prevalence = colMeans(theta),
+  frex = apply(words$frex, 1, str_c, collapse = ", "),
+  prob = apply(words$prob, 1, str_c, collapse = ", ")) |>
+  dplyr::left_join(paragraph_theta |>
+                     dplyr::group_by(topic) |>
+                     dplyr::summarise(n_paras = dplyr::n(), avepp = mean(theta_max)),
+                   by = "topic")
+
+theta_out <- p_out("paragraph_theta.parquet")
+arrow::write_parquet(paragraph_theta, theta_out)
+arrow::write_parquet(topic_summary, p_out("topic_summary.parquet"))
+
+writeLines(glue::glue("Entropy R2 = {round(entropy_r2, 3)}. \\
+  Topics with AvePP under 0.7: {sum(topic_summary$avepp < 0.7, na.rm = TRUE)} of {K}."))
+topic_summary |>
+  dplyr::arrange(dplyr::desc(prevalence)) |>
+  dplyr::select(topic, prevalence, n_paras, avepp) |>
+  tbl_paged(caption = "Topics by prevalence.")
+```
+
+# Topic codebook
+
+One call per topic, all in parallel. Each call sees only that topic's evidence: its `r tx$n_words` most distinctive (FREX) and most probable words and its `r tx$n_examples` most typical paragraphs. It drafts a label, a one-sentence description, and a candidate proposition for stance.R. The file is written once: if `topic_codebook.csv` exists it is read, not redrafted, so your edits survive. Delete it to redraft.
+
+```{r codebook}
+#| results: asis
+cb_path <- p_out("topic_codebook.csv")
+check_inputs(cb_path, theta_out)
+if (file.exists(cb_path)) {
+  codebook <- readr::read_csv(cb_path, show_col_types = FALSE)
+  writeLines(glue::glue("Existing codebook read ({nrow(codebook)} topics); no calls made."))
+} else {
+  examples <- paragraph_theta |>
+    dplyr::group_by(topic) |>
+    dplyr::slice_max(theta_max, n = tx$n_examples, with_ties = FALSE) |>
+    dplyr::summarise(ex = str_c("- ", str_trunc(text, 400), collapse = "\n"))
+  ev <- dplyr::left_join(topic_summary, examples, by = "topic")
+  sys <- build_prompt(
+    role = "You are a survey methodologist who names statistical topics so colleagues can use them.",
+    task = str_c("Read one topic's words and example paragraphs from speeches at the UN ",
+                 "General Assembly. Write a short label, one factual sentence on what the ",
+                 "paragraphs discuss, and one proposition: a single claim, in one sentence, ",
+                 "that a paragraph on this topic could agree or disagree with. Check every ",
+                 "word against the evidence."),
+    rules = c("Use only the words and paragraphs shown.",
+              "Do not infer which country is speaking or its intent.",
+              "Do not invent statistics, dates, places, or names.",
+              "The proposition states one side only: never 'X over Y' or 'X rather than Y'.",
+              "If the evidence is mixed, say so plainly."),
+    output = "A label of at most 4 words, a one-sentence description, and a one-sentence proposition.")
+  type <- ellmer::type_object(
+    label = ellmer::type_string("At most 4 words."),
+    description = ellmer::type_string("One factual sentence."),
+    proposition = ellmer::type_string("One claim, one sentence."))
+  prompts <- str_c("Distinctive words: ", ev$frex, "\nMost probable words: ", ev$prob,
+                   "\nExample paragraphs:\n", ev$ex)
+  drafts <- ask_many(make_chat("codebook", sys, tx$steps, tx$use_openrouter),
+                     prompts, type)
+  codebook <- tibble(topic = ev$topic, label = drafts$label,
+                     description = drafts$description,
+                     proposition = drafts$proposition) |>
+    dplyr::arrange(topic)
+  readr::write_csv(codebook, cb_path, na = "")
+  record_inputs(cb_path, theta_out)
+  if (anyNA(codebook$label))
+    warning(sum(is.na(codebook$label)), " topics got no label; name them by hand.")
+}
+
+codebook |>
+  dplyr::left_join(dplyr::select(topic_summary, topic, frex), by = "topic") |>
+  dplyr::mutate(title = str_c("Topic ", topic, ": ", label)) |>
+  tbl_records("title", c("description", "proposition", "frex"),
+              caption = "Topic codebook. Edit the CSV; nothing redrafts it.")
+```
+
+# Prevalence over time
+
+For each topic, its share of each paragraph is regressed on the year spline with a fractional logit (Papke and Wooldridge 1996), so every estimated share stays between 0 and 1. The model is refit on `r tx$n_draws` draws of the topic shares and the results combined, so the 95 percent intervals include the topic model's own uncertainty and the clustering of paragraphs within a speech. Because the set of countries speaking changes from year to year, a trend mixes change within countries with change in who spoke.
+
+```{r effects}
+draws <- withr::with_seed(tx$seed, purrr::map(seq_len(tx$n_draws), function(i)
+  do.call(rbind, stm::thetaPosterior(stm_fit, nsims = 1, type = "Global"))))
+topic_trends <- purrr::map(seq_len(K), function(k)
+  topic_trend(draws, k, bs, sort(unique(meta$year)), meta$id)) |>
+  purrr::list_rbind()
+arrow::write_parquet(topic_trends, p_out("topic_trends.parquet"))
+```
+
+```{r trend-plots}
+#| fig-height: 8
+#| fig-cap: "Expected topic share by year with 95 percent intervals, nine topics per page, most prevalent first."
+pages <- topic_trends |>
+  dplyr::left_join(dplyr::select(codebook, topic, label), by = "topic") |>
+  dplyr::left_join(dplyr::select(topic_summary, topic, prevalence), by = "topic") |>
+  dplyr::mutate(name = str_c(topic, ". ", str_trunc(label, 24)),
+                page = (dplyr::dense_rank(dplyr::desc(prevalence)) - 1) %/% 9) |>
+  dplyr::group_split(page)
+purrr::walk(pages, function(d) print(
+  ggplot(d, aes(year, fit)) +
+    geom_ribbon(aes(ymin = lo, ymax = hi), alpha = 0.2, fill = viridis(1, begin = 0.35)) +
+    geom_line(color = viridis(1, begin = 0.35)) +
+    facet_wrap(~ name, scales = "free_y", ncol = 3) +
+    labs(x = NULL, y = "expected topic share")))
+```
