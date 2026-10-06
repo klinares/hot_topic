@@ -1,5 +1,7 @@
-# topics_source.R: shared functions for preprocess.qmd and topics.qmd.
-# Only function definitions live here; nothing runs when it is sourced.
+# topics_source.R: shared functions for preprocess.qmd and topics.qmd, and
+# for the UNGA scripts, which reuse them on a corpus that needs no
+# preprocessing. Only function definitions live here; nothing runs when it is
+# sourced.
 #   1. Setup and model calls
 #   2. Output guard (manifest.csv)
 #   3. Paragraph units
@@ -14,10 +16,11 @@
 # ---- 1. Setup and model calls ------------------------------------------------
 
 `%||%` <- function(x, y) if (is.null(x) || length(x) == 0) y else x
-# The raw corpus goes in topics/inputs; everything the scripts write goes in
-# topics/outputs, which is also where the app reads it.
-p_in <- function(f) here::here("topics", "inputs", f)
-p_out <- function(f) here::here("topics", "outputs", f)
+# Each project reads its corpus from <project>/inputs and writes everything to
+# <project>/outputs. The project is an option so one copy of these functions
+# serves topics/ and unga/: each script sets it before sourcing this file.
+p_in <- function(...) here::here(getOption("hot_topic.project", "topics"), "inputs", ...)
+p_out <- function(...) here::here(getOption("hot_topic.project", "topics"), "outputs", ...)
 
 # Every prompt has the same four parts, so each one reads the same way.
 build_prompt <- function(role, task, rules, output) {
@@ -300,9 +303,10 @@ link_corpus <- function(blocks, vec, min_tokens, max_tokens, min_sim) {
 
 # ---- 4. Topic model helpers --------------------------------------------------
 
-# Tokens for the topic model: lowercase, letters only, no stopwords, and no
-# month or weekday names, which would let topics encode the year directly.
-clean_tokens <- function(paras) {
+# Tokens for the topic model: lowercase, letters only, no stopwords, no month
+# or weekday names (they would let topics encode the year directly), and no
+# words in `drop` (boilerplate every document shares).
+clean_tokens <- function(paras, drop = character()) {
   temporal <- str_to_lower(c(month.name, month.abb, "monday", "tuesday",
                              "wednesday", "thursday", "friday", "saturday",
                              "sunday"))
@@ -312,7 +316,7 @@ clean_tokens <- function(paras) {
     dplyr::mutate(word = str_remove_all(word, "'")) |>
     dplyr::filter(str_detect(word, "^[a-z]{2,}$"),
                   !word %in% tidytext::get_stopwords()$word,
-                  !word %in% temporal)
+                  !word %in% temporal, !word %in% drop)
 }
 
 # Tokens to stm's input format: a vocabulary, and per paragraph a 2-row

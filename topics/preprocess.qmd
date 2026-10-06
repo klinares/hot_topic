@@ -28,12 +28,13 @@ suppressPackageStartupMessages({
   library(tidyverse)  # tidyverse last so its verbs win
 })
 theme_set(theme_minimal(base_size = 12))
+options(hot_topic.project = "topics")  # paths: topics/inputs, topics/outputs
 source(here::here("topics", "topics_source.R"))
 if (isTRUE(tx$use_openrouter)) {
   source(here::here("topics", "llm_openrouter.R"))
   tx$steps$model <- open_router_models[tx$steps$step]
 }
-dir.create(p_out(""), showWarnings = FALSE)
+dir.create(p_out(), showWarnings = FALSE)
 ```
 
 # Corpus

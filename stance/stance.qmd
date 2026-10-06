@@ -44,7 +44,7 @@ Every passage in the corpus is read by a language model and labeled for its stan
 
 $$P(\text{favor}) = P(\text{addresses}) \times P(\text{favor} \mid \text{addresses})$$
 
-- **Salience** is the share of *all* passages that address the claim, that is $1 - P(\textit{irrelevant})$. It says whether the claim is live in the corpus.
+- **Salience** is the share of *all* passages that address the claim, that is $1 - P(\text{irrelevant})$. It says whether the claim is live in the corpus.
 - **Favor, neutral, oppose** are shares of the passages that *do* address it. They say which way those writers lean.
 
 Reported together, the two separate a rise in agreement from a rise in attention; a single combined share cannot tell them apart. Multiplying them back together recovers a share of all passages. The cost is that the direction estimates rest on a smaller base that moves over time, so a period can hold plenty of passages and still hold too few that address the claim. Each basis therefore gets its own period set, and the report says what was dropped.
@@ -150,7 +150,7 @@ stance_plot_static(static)
 #| results: asis
 trends <- if (nzchar(st$time_col)) stance_trends(coded) else NULL
 purrr::walk(attr(trends, "notes"), function(x) writeLines(str_c("**", x, "**\n")))
-counts <- list(uploaded = nrow(paras), coded = nrow(coded),
+counts <- list(total = nrow(paras), coded = nrow(coded),
                excluded = nrow(paras) - nrow(coded),
                documents = dplyr::n_distinct(coded$cluster))
 stance_record(stance_table(static, trends), st$proposition, prompt, ep, counts) |>
@@ -170,10 +170,11 @@ if (!stance_has_trend(trends)) {
 
 ```{r trend-plots}
 #| fig-height: 3
-#| fig-cap: "Salience: the share of all passages that address the claim. Then the three directions among the passages that do, on one shared scale because they are shares of the same passages and add to 100 percent. Intervals are 95 percent, clustered by document, and do not include error in the model's labels."
+#| fig-cap: "Salience: the share of all passages that address the claim. Then the three directions among the passages that do, on one shared scale because they are shares of the same passages and add to 100 percent. Points are the observed share in each period, sized by the passages behind it. Intervals are 95 percent, clustered by document, and do not include error in the model's labels."
 if (stance_has_trend(trends)) {
-  print(stance_plot_salience(trends))
-  print(stance_plot_direction(trends))
+  obs <- stance_observed(coded)
+  print(stance_plot_salience(trends, obs))
+  print(stance_plot_direction(trends, obs))
 }
 ```
 

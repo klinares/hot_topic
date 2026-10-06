@@ -13,7 +13,7 @@ execute:
 
 ```{r config}
 tx <- list(
-  input_file = "unga.parquet",  # in unga/input/: id, para_id, year, country, raw_text
+  input_file = "unga.parquet",  # in unga/inputs/: id, para_id, year, country, raw_text
   seed = 2026L,
   min_docfreq = 5L,  # drop words in fewer paragraphs than this
   drop_words = c("united", "nations", "general", "assembly", "session",
@@ -24,7 +24,7 @@ tx <- list(
   spline_df = 5L,  # flexibility of the year trend
   n_words = 20L,  # words per topic shown to the codebook model
   n_examples = 5L,  # example paragraphs per topic shown to the codebook model
-  n_draws = 25L,  # draws of topic shares behind each trend interval
+  n_draws = 25L,  # draws of topic shares behind each trend interval; memory is draws x paragraphs x K
   workers = 8L,
   use_openrouter = TRUE,  # FALSE at work
   steps = tibble::tribble(
@@ -37,9 +37,11 @@ suppressPackageStartupMessages({
 })
 theme_set(theme_minimal(base_size = 12))
 set.seed(tx$seed)
-source(here::here("unga", "code", "unga_source.R"))
+# The topics project's functions, pointed at unga/inputs and unga/outputs.
+options(hot_topic.project = "unga")
+source(here::here("topics", "topics_source.R"))
 if (isTRUE(tx$use_openrouter)) {
-  source(here::here("unga", "code", "unga_openrouter.R"))
+  source(here::here("topics", "llm_openrouter.R"))
   tx$steps$model <- open_router_models[tx$steps$step]
 }
 dir.create(p_out(), showWarnings = FALSE)
@@ -109,7 +111,7 @@ Take the smallest K where held-out likelihood has flattened and residual dispers
 if (isTRUE(tx$run_searchK)) {
   future::plan(future::multisession, workers = tx$workers)
   ho <- stm::make.heldout(stm_in$documents, stm_in$vocab, seed = tx$seed)
-  metrics <- cached(p_out("searchK.rds"), raw_in,
+  metrics <- cached(p_out("searchK.parquet"), raw_in,
     furrr::future_map(tx$K_grid, function(k) {
       fit <- stm::stm(ho$documents, ho$vocab, K = k, init.type = "Spectral",
                       prevalence = prev_form, data = meta, verbose = FALSE)
@@ -243,7 +245,8 @@ draws <- withr::with_seed(tx$seed, purrr::map(seq_len(tx$n_draws), function(i)
   do.call(rbind, stm::thetaPosterior(stm_fit, nsims = 1, type = "Global"))))
 topic_trends <- purrr::map(seq_len(K), function(k)
   topic_trend(draws, k, bs, sort(unique(meta$year)), meta$id)) |>
-  purrr::list_rbind()
+  purrr::list_rbind() |>
+  dplyr::rename(year = Year)
 arrow::write_parquet(topic_trends, p_out("topic_trends.parquet"))
 ```
 
@@ -262,4 +265,11 @@ purrr::walk(pages, function(d) print(
     geom_line(color = viridis(1, begin = 0.35)) +
     facet_wrap(~ name, scales = "free_y", ncol = 3) +
     labs(x = NULL, y = "expected topic share")))
+```
+
+```{r handoff}
+#| results: asis
+writeLines(glue::glue("Wrote paragraph_theta.parquet, topic_summary.parquet, \\
+  topic_trends.parquet, topic_codebook.csv, stm_fit.rds to unga/outputs/. \\
+  Next: pick a topic and a proposition from the codebook and run stance.R."))
 ```

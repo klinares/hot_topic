@@ -40,8 +40,8 @@ fake <- dplyr::mutate(paras, label = withr::with_seed(1L, sample(
 stance_static(fake)
 tr <- stance_trends(fake)
 attr(tr, "notes")
-stance_plot_salience(tr)
-stance_plot_direction(tr)
+stance_plot_salience(tr, stance_observed(fake))
+stance_plot_direction(tr, stance_observed(fake))
 
 # 4. The app. Upload a CSV on the Detect stance page and run a claim. The
 #    STANCE_KEY above only reaches it because it is the same R session.

@@ -258,7 +258,7 @@ mod_stance_server <- function(id) {
       coded <- dplyr::filter(todo, !is.na(label))
       static <- stance_static(coded)
       trends <- if ("time" %in% names(coded)) stance_trends(coded) else NULL
-      counts <- list(uploaded = nrow(p), coded = nrow(coded),
+      counts <- list(total = nrow(p), coded = nrow(coded),
                      excluded = sum(!p$keep) + sum(is.na(todo$label)),
                      documents = dplyr::n_distinct(coded$cluster))
       labeled <- raw() |>
@@ -292,7 +292,7 @@ mod_stance_server <- function(id) {
         tags$p(sprintf(
           "%s of %s passages labeled, from %s document(s), in %s.",
           format(r$counts$coded, big.mark = ","),
-          format(r$counts$uploaded, big.mark = ","),
+          format(r$counts$total, big.mark = ","),
           format(r$counts$documents, big.mark = ","), fmt_dur(r$minutes * 60))),
         if (!stance_has_trend(r$trends)) tags$p(class = "small",
           tags$strong("Static estimate. "),
@@ -319,8 +319,14 @@ mod_stance_server <- function(id) {
     })
 
     output$plot_static <- renderPlot(stance_plot_static(req(run())$static))
-    output$plot_sal <- renderPlot(stance_plot_salience(req(run())$trends))
-    output$plot_dir <- renderPlot(stance_plot_direction(req(run())$trends))
+    output$plot_sal <- renderPlot({
+      r <- req(run())
+      stance_plot_salience(r$trends, stance_observed(r$coded))
+    })
+    output$plot_dir <- renderPlot({
+      r <- req(run())
+      stance_plot_direction(r$trends, stance_observed(r$coded))
+    })
 
     output$overall_head <- renderUI({
       req(run())

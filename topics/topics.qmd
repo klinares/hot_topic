@@ -36,6 +36,7 @@ suppressPackageStartupMessages({
 })
 theme_set(theme_minimal(base_size = 12))
 set.seed(tx$seed)
+options(hot_topic.project = "topics")  # paths: topics/inputs, topics/outputs
 source(here::here("topics", "topics_source.R"))
 if (isTRUE(tx$use_openrouter)) {
   source(here::here("topics", "llm_openrouter.R"))

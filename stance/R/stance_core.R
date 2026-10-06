@@ -181,13 +181,19 @@ cluster_vcov <- function(model, cluster) {
   bread %*% crossprod(S) %*% bread * G / (G - 1)
 }
 
-# Share of a 0/1 outcome with a 95% interval clustered by document.
+# Share of a 0/1 outcome with a 95% interval clustered by document. The
+# interval is built on the logit scale, like the trends, so it stays inside 0
+# to 1 without clipping and is not symmetric near the edges. A share of exactly
+# 0 or 1 has no interval on that scale and gets none.
 share_ci <- function(y, cluster) {
   p <- mean(y)
   z <- tapply(y - p, cluster, sum) / length(y)
   G <- length(z)
   se <- sqrt(G / (G - 1) * sum(z^2))
-  tibble::tibble(share = p, lo = max(0, p - 1.96 * se), hi = min(1, p + 1.96 * se))
+  if (p <= 0 || p >= 1) return(tibble::tibble(share = p, lo = NA_real_, hi = NA_real_))
+  h <- 1.96 * se / (p * (1 - p))
+  tibble::tibble(share = p, lo = stats::plogis(stats::qlogis(p) - h),
+                 hi = stats::plogis(stats::qlogis(p) + h))
 }
 
 # P(y = 1) over time: logistic regression on a time spline with 95% intervals
@@ -295,6 +301,16 @@ stance_trends <- function(d, df_spline = stance_defaults$df_spline,
 # Nothing fitted means a 0-row table, not NULL, so the notes saying why survive.
 stance_has_trend <- function(trends) !is.null(trends) && nrow(trends) > 0
 
+# The observed share in each period, the data behind each curve. Drawn under
+# the curves so a reader sees where the smooth departs from the data; it
+# matters most at the last period, where a spline leans on earlier years.
+stance_observed <- function(d) {
+  purrr::imap(stance_parts(d$label), function(p, nm)
+    tibble::tibble(quantity = nm, time = d$time[p$use], y = p$y[p$use])) |>
+    purrr::list_rbind() |>
+    dplyr::summarise(share = mean(y), n = dplyr::n(), .by = c(quantity, time))
+}
+
 # The estimates to publish: the trends when time carried them, otherwise the
 # static shares, tagged so a reader can tell which they are looking at.
 stance_table <- function(static, trends = NULL) {
@@ -319,7 +335,7 @@ stance_sheet <- function(coded, proposition, n = 400L, seed = 2026L) {
 stance_record <- function(est, proposition, prompt, ep, counts) {
   if (is.null(est) || nrow(est) == 0) return(NULL)
   dplyr::mutate(est, proposition = proposition, model = ep$model,
-                endpoint = ep$url, passages_uploaded = counts$uploaded,
+                endpoint = ep$url, passages_total = counts$total,
                 passages_coded = counts$coded, passages_excluded = counts$excluded,
                 documents = counts$documents, date = as.character(Sys.Date()),
                 prompt = prompt)
@@ -332,10 +348,21 @@ stance_colors <- c(salience = "#21918c", favor = "#3b528b",
 
 # Salience on its own, because it answers a different question from the
 # direction panels and is on a different base.
-stance_plot_salience <- function(trends) {
+# `observed` (from stance_observed) adds the period shares as points sized by
+# the passages behind them; only periods in the curve are drawn.
+stance_points <- function(observed, trends) {
+  if (is.null(observed)) return(NULL)
+  o <- dplyr::semi_join(observed, trends, by = c("quantity", "time"))
+  list(ggplot2::geom_point(data = o, ggplot2::aes(time, share, size = n),
+                           alpha = 0.35, inherit.aes = FALSE),
+       ggplot2::scale_size_area(max_size = 3, guide = "none"))
+}
+
+stance_plot_salience <- function(trends, observed = NULL) {
   d <- dplyr::filter(trends, quantity == "salience")
   if (nrow(d) == 0) return(NULL)
   ggplot2::ggplot(d, ggplot2::aes(time, fit)) +
+    stance_points(observed, d) +
     ggplot2::geom_ribbon(ggplot2::aes(ymin = lo, ymax = hi), alpha = 0.2,
                          fill = stance_colors[["salience"]]) +
     ggplot2::geom_line(linewidth = 0.9, color = stance_colors[["salience"]]) +
@@ -348,10 +375,11 @@ stance_plot_salience <- function(trends) {
 
 # The three directions share one axis: they are shares of the same passages and
 # add to 100 percent, so a common scale is what makes them comparable.
-stance_plot_direction <- function(trends) {
+stance_plot_direction <- function(trends, observed = NULL) {
   d <- dplyr::filter(trends, quantity %in% stance_direction)
   if (nrow(d) == 0) return(NULL)
   ggplot2::ggplot(d, ggplot2::aes(time, fit, color = quantity, fill = quantity)) +
+    stance_points(observed, d) +
     ggplot2::geom_ribbon(ggplot2::aes(ymin = lo, ymax = hi), alpha = 0.18,
                          color = NA) +
     ggplot2::geom_line(linewidth = 0.9) +
@@ -362,15 +390,17 @@ stance_plot_direction <- function(trends) {
                                 limits = c(0, NA)) +
     ggplot2::labs(x = NULL, y = NULL,
                   title = "Among the passages that address the claim") +
-    ggplot2::theme_minimal(base_size = 13)
+    ggplot2::theme_minimal(base_size = 13) +
+    ggplot2::theme(panel.spacing.x = grid::unit(1.5, "lines"))
 }
 
 # When time cannot carry a trend, the whole file in one picture.
 stance_plot_static <- function(static) {
   d <- dplyr::mutate(static, quantity = factor(quantity, rev(c("salience", stance_direction))))
   ggplot2::ggplot(d, ggplot2::aes(share, quantity, color = as.character(quantity))) +
-    ggplot2::geom_pointrange(ggplot2::aes(xmin = lo, xmax = hi), linewidth = 0.8,
-                             size = 0.5) +
+    ggplot2::geom_pointrange(ggplot2::aes(xmin = dplyr::coalesce(lo, share),
+                                          xmax = dplyr::coalesce(hi, share)),
+                             linewidth = 0.8, size = 0.5) +
     ggplot2::facet_grid(basis ~ ., scales = "free_y", space = "free_y", switch = "y") +
     ggplot2::scale_color_manual(values = stance_colors, guide = "none") +
     ggplot2::scale_x_continuous(labels = function(x) paste0(round(100 * x), "%"),
