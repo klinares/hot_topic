@@ -1,0 +1,3 @@
+output,input,md5
+stm_fit.rds,paragraphs.csv,2de5c81eaf3198458322ec1c81484821
+topic_codebook.csv,paragraph_theta.csv,075267614a5e546385b98f353b0f2461

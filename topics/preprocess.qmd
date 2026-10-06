@@ -1,6 +1,6 @@
 ---
 title: "Preprocessing: comments to paragraph units"
-subtitle: "Step 1 of 3. Then topics.qmd, then stance.qmd"
+subtitle: "Step 1 of 2. Then topics.qmd"
 format:
   typst:
     toc: false
@@ -28,12 +28,12 @@ suppressPackageStartupMessages({
   library(tidyverse)  # tidyverse last so its verbs win
 })
 theme_set(theme_minimal(base_size = 12))
-source(here::here("code", "llm_source.R"))
+source(here::here("topics", "topics_source.R"))
 if (isTRUE(tx$use_openrouter)) {
-  source(here::here("code", "llm_openrouter.R"))
+  source(here::here("topics", "llm_openrouter.R"))
   tx$steps$model <- open_router_models[tx$steps$step]
 }
-dir.create(here::here("app", "outputs"), showWarnings = FALSE)
+dir.create(p_out(""), showWarnings = FALSE)
 ```
 
 # Corpus
@@ -46,7 +46,7 @@ corpus_raw <- tibble(
   Year = quanteda::docvars(quanteda::data_corpus_inaugural, "Year"),
   body_english = as.character(quanteda::data_corpus_inaugural))
 # At work:
-# corpus_raw <- readr::read_csv(here("input", "YOUR_FILE.csv"))
+# corpus_raw <- readr::read_csv(p_in("YOUR_FILE.csv"))
 ```
 
 ```{r validate}

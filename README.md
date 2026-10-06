@@ -2,35 +2,48 @@
 
 ![](images/hot_topic_logo.svg)
 
-What people write about in a corpus of public comments, how that changes over time, and where they stand on a claim. Three Quarto scripts and a Shiny dashboard.
+Two tools over the same kind of text, each with its own Quarto scripts, its own Shiny app, and its own deployment.
 
 ```         
-code/preprocess.qmd   comments -> paragraph units
-code/topics.qmd       paragraph units -> STM topics, codebook, prevalence trends
-code/stance.qmd       one claim -> stance and attention trends (experimental)
-app/                  dashboard over the topics outputs
-outputs/              everything the scripts write; the app reads from here
+topics/   what a corpus is written about, and how that changes over time
+stance/   where writers stand on one claim, in any corpus a user uploads
 ```
 
-`code/llm_source.R` holds every shared function. `code/llm_openrouter.R` is the home provider and is deleted at work.
+They were one project and are now two, because they have nothing in common at run time. `topics/` fits a model once and serves the result; `stance/` calls a language model on every run and holds its R process while it does. Splitting them means a stance run cannot freeze the topics dashboard, and either can be deployed, restarted, or taken down without the other.
 
-Topics and stance are independent. Topics answer "what is written about"; stance answers "where do writers stand on this claim". Stance reads only the preprocess outputs, so a claim can be measured whether or not it matches a topic.
+Each folder has the same shape:
 
-## Run order
+```         
+<project>/
+  app.R           the Shiny app
+  *.qmd           the scripts, which are also the method reports
+  *_source.R      shared functions for the scripts
+  R/              the app's own functions
+  inputs/         raw data you put there; not tracked by git
+  outputs/        everything the scripts write; the topics app reads from here
+```
+
+## topics/
+
+```         
+topics/preprocess.qmd   comments -> paragraph units
+topics/topics.qmd       paragraph units -> STM topics, codebook, prevalence trends
+topics/app.R            dashboard: topics, and the paragraphs behind them
+```
 
 | Step | What to set | Model calls |
 |------------------------|------------------------|------------------------|
 | 1\. `preprocess.qmd` | your corpus read, `min_tokens`, `max_tokens` | one embedding request per comment, first run only |
 | 2\. `topics.qmd` | `K` (after one `run_searchK` pass) | one per topic, first run only |
-| 3\. `stance.qmd` | `name`, `proposition`, `negation` | 2 embeddings, plus the coding budget |
-| 4\. `app/` | nothing | none |
+| 3\. `app.R` | nothing | none |
 
-1.  **preprocess.qmd.** Replace the corpus chunk with your own read. It needs three columns: `atom_id` (comment id), `Year` (integer), `body_english` (text). Later renders reuse `embeddings.rds` and make no calls.
+1.  **preprocess.qmd.** Put your corpus in `topics/inputs/` and replace the corpus chunk with your own read (`p_in("YOUR_FILE.csv")`). It needs three columns: `atom_id` (comment id), `Year` (integer), `body_english` (text). Later renders reuse `embeddings.parquet` and make no calls.
 2.  **topics.qmd.** Render once with `run_searchK = TRUE` to choose K, set `K`, then render normally. Render once with `run_sensitivity = TRUE` to check that the merge settings do not drive the topics. The first full render drafts `topic_codebook.csv`; edit it by hand, as it is never redrafted while the file exists.
-3.  **stance.qmd.** Write the claim, its negation, and a short `name` for its files. Each claim keeps its own labels, so several claims coexist in `outputs/`.
-4.  **app.** `shiny::runApp("app")` from the repo root.
+3.  **app.** `shiny::runApp("topics")` from the repo root. Three tabs: **Start here** (what the data is, with descriptives and links to the method reports), **Topics** (prevalence over time, assignment sharpness, the codebook), **Read** (the paragraphs behind a topic, with the whole comment on click, and CSV downloads).
 
-## How paragraph units are built
+`topics_source.R` holds the shared functions. `llm_openrouter.R` is the home provider for embeddings and the codebook, and is deleted at work.
+
+### How paragraph units are built
 
 Most comments break after every sentence, which leaves orphan sentences too short for a topic model. `preprocess.qmd`:
 
@@ -43,105 +56,122 @@ Most comments break after every sentence, which leaves orphan sentences too shor
 
 Read the dropped share, overall and by year, in the render. If it is large or concentrated in some years, loosen the settings: those years then rest on the longer, better formed comments.
 
-## How stance is measured
-
-Coding every paragraph would cost one call each. Instead `stance.qmd` uses **two-phase stratified sampling**:
-
-1.  **Score.** The claim and its negation are embedded with the corpus model (2 calls). Each paragraph takes the higher of its two cosines, so paragraphs arguing against the claim in their own words rank as high as ones echoing it. Paragraph vectors come from `preprocess.qmd`, so nothing is re-embedded.
-2.  **Stratify.** Paragraphs are ranked by that score into high, middle and low strata. A sample is drawn from each, heavier where the claim is likely, never zero anywhere. Unused calls roll down to the next stratum, so the whole budget is spent.
-3.  **Code.** One call per sampled paragraph returns favor, neutral, oppose, or irrelevant.
-4.  **Weight.** Each coded paragraph carries the weight N/n of its stratum, so estimates describe the whole corpus, not only the paragraphs that were read.
-
-Two lines come out, both with intervals clustered by comment:
-
-- **stance**: the share of paragraphs addressing the claim that favor it.
-- **attention**: the share of all paragraphs that address the claim at all.
-
-Read them together. A change in stance with flat attention is a change of opinion; a change in attention with flat stance is a change in what gets discussed.
-
-**The low stratum is the audit.** Its relevance rate, printed in the labels table, is the share of low-similarity paragraphs that turned out relevant. A low value means the similarity screen missed little. A high value means it missed a lot, those paragraphs carry heavy weights, and every interval widens; the fix is to move budget from `high` to `low` in `st$n`.
-
-## Rate limits and budget
-
-The coding loop is built around quota windows, and every limit is a setting. Nothing in the code assumes one provider.
-
-``` r
-window_n   = 300L   # calls per window: the most one quota window allows
-window_wait = 60L   # seconds to rest between windows
-rpm        = 300L   # requests a minute ellmer may start
-max_active = 10L    # simultaneous connections
-n = c(high = 200L, mid = 70L, low = 30L)   # coding budget per stratum
-```
-
-| Host | Settings |
-|------------------------------------|------------------------------------|
-| 300 calls per 4 hours | `window_n = 300`, `window_wait = 4 * 3600`, `rpm = 300` |
-| 500 a minute | `window_n = 500`, `window_wait = 60`, `rpm = 500` |
-| no token or rate limit | `window_wait = 0`, `window_n` and `rpm` above the budget, `max_active` 40 or more |
-
-Labels are saved after every window, so a run that is interrupted, crashes, or waits four hours resumes where it stopped and re-sends nothing.
-
-**With no limits, code the census.** Set every entry of `n` above the corpus size. Every paragraph is coded, all weights become 1, sampling error disappears, and only label error remains. The strata table then shows `weight` 1 throughout. At `max_active = 40`, a thousand paragraphs take well under a minute.
-
-## Outputs (all in outputs/)
+### topics/outputs/
 
 | File | Written by | What |
 |------------------------|------------------------|------------------------|
 | `paragraphs.csv` | preprocess | the paragraph units, one row each |
 | `dropped_units.csv` | preprocess | units too short to place, for review |
-| `blocks.csv`, `embeddings.rds`, `merge_settings.rds` | preprocess | inputs to the sensitivity test |
-| `paragraph_vectors.rds` | preprocess | one vector per paragraph, for stance similarity |
+| `blocks.csv`, `embeddings.parquet`, `merge_settings.parquet` | preprocess | inputs to the sensitivity test |
 | `paragraph_theta.csv` | topics | units with topic shares, assigned topic, theta |
 | `topic_summary.csv` | topics | per-topic words, prevalence, AvePP |
 | `topic_trends.csv` | topics | estimated topic share by year with intervals |
 | `topic_codebook.csv` | topics | labels, descriptions, propositions (edit by hand) |
-| `stm_fit.rds`, `searchK.rds`, `sensitivity*.{rds,csv}` | topics | model caches |
-| `stance_labels_NAME.csv` | stance | one row per coded paragraph, with its stratum and weight |
-| `stance_trend_NAME.csv` | stance | both fitted lines |
-| `stance_prompt_NAME.txt` | stance | the exact prompt that produced those labels |
-| `manifest.csv` | all | which inputs each cache was built from |
+| `stm_fit.rds` | topics | the fitted model, reloaded on later renders |
+| `searchK.parquet`, `sensitivity.parquet` | topics | diagnostics, computed once |
+| `manifest.csv` | both | which inputs each cache was built from |
 
-`manifest.csv` records the md5 of every input a cache was built from. If an input changes, the next render stops and names the file to delete, so a stale model is never reloaded.
+The app reads only the four CSVs: `paragraph_theta.csv`, `topic_codebook.csv`, `topic_summary.csv`, `topic_trends.csv`. It never fits a topic model and never writes to disk.
 
-## The app
+## stance/
 
-Three tabs: **Start here** (what the data is, with descriptives), **Topics** (prevalence over time, assignment sharpness, the codebook), **Read** (the paragraphs behind a topic, with the whole comment on click, and CSV downloads).
-
-It reads `paragraph_theta.csv`, `topic_codebook.csv`, `topic_summary.csv` and `topic_trends.csv` straight from `outputs/`, and never fits anything.
-
-Two deployment settings, both read at startup:
-
-``` r
-options(drsvyr.classification = "YOUR MARKING")   # the banner above every tab
-options(hot_topic.source = "public comments submitted to ...")  # names the text on Start here
+```         
+stance/stance.qmd   one claim over one corpus, with the method written out
+stance/app.R        upload a CSV, write a claim, get labels and estimates
 ```
 
-Unset, the banner reads UNCLASSIFIED and the text says "public comments". Posit Connect deploys only `app/`, so `../outputs/` is not there: set `HOT_TOPIC_DATA` to a folder the server can read, or copy the four files into `app/data/` and set `HOT_TOPIC_DATA=data`.
+The app takes a user's own CSV: they point at the text column, optionally at a time column and a document column, write a claim, and every row is coded. They download their file with a `stance` column added, the estimates, and a sheet of 400 passages to code by hand as a check. Nothing is written to the server's disk and nothing is read from `outputs/`.
 
-## Settings for work
+`shiny::runApp("stance")` from the repo root. Three pages: **Start here** (how to prepare a file, what the tool has been tried on, and what it does not measure), **Detect stance** (the run), **Check the labels** (hand codes in, agreement out).
+
+To run the documented version over a corpus: put the CSV in `stance/inputs/`, name it and its columns in the config chunk at the top of `stance.qmd`, write the claim, and render. For the topics corpus, that CSV is `topics/outputs/paragraph_theta.csv`.
+
+### How stance is measured
+
+Every passage is coded; nothing is sampled.
+
+1.  **Code.** Each passage goes alone to the model named by `STANCE_URL` and `STANCE_MODEL`, one request at a time, at temperature 0, without its date or its document. The reply is one of favor, neutral, oppose, or irrelevant (does not address the claim). The first passage is a probe: if the model cannot be reached, the run stops at once with the reason.
+2.  **Estimate.** Four quantities, because a share of all passages confounds two different things:
+
+$$P(\text{favor}) = P(\text{addresses}) \times P(\text{favor} \mid \text{addresses})$$
+
+-   **Salience** is the share of *all* passages that address the claim. It says whether the claim is live.
+-   **Favor, neutral, oppose** are shares of the passages that *do* address it. They say which way.
+
+Reported together they separate a rise in agreement from a rise in attention. The cost is that the direction estimates rest on a smaller base that moves over time, so each basis gets its own period set and the app reports what was dropped.
+
+Each quantity is a logistic regression on a natural spline in time with 95 percent intervals clustered by document. **A period needs at least 30 passages to appear in a trend, and a trend needs at least 4 such periods; otherwise time is dropped and the estimate is static.** Thin periods leave the trend but stay in the static estimate. With no time column the estimate is static from the start.
+
+Only passages between 5 and 250 words are coded. Rows outside the bounds are reported and left uncoded. Those bounds guard against the wrong unit of text; the tested range is much narrower (paragraphs of roughly 50 to 80 tokens).
+
+A time column may be a numeric year, `YYYY-MM`, or a date. Months become `year + (month - 1) / 12`, so one unit of time is one year either way.
+
+`stance.qmd` saves labels every `save_every` passages and resumes where it stopped. The app keeps nothing: it shows the estimates and offers them as a CSV that records the claim, the full prompt, the model, the endpoint, the counts, and the date.
+
+### stance/outputs/ (written by stance.qmd only)
+
+| File | What |
+|------------------------|------------------------------------------------|
+| `stance_labels_NAME.csv` | one label per coded row, keyed by row number |
+| `stance_estimates_NAME.csv` | the estimates with the claim, prompt, model, counts, date |
+| `stance_prompt_NAME.txt` | the exact prompt and model that produced those labels |
+| `stance_handcode_NAME.csv` | 400 passages drawn at random, with no model label |
+| `manifest.csv` | which inputs each saved file was built from |
+
+### Checking the labels
+
+The intervals treat the labels as correct. Nothing in the pipeline measures how often they are not. Code 400 passages by hand without seeing the model's label, upload them, and read agreement, Cohen's kappa (both with bootstrap intervals over documents), and the confusion matrix. 400 puts agreement within about 5 points; it says little about a label the model rarely uses, so the per-label rows carry their counts and are marked thin under 30 cases.
+
+## Settings
+
+`manifest.csv` records the md5 of every input a cache was built from. If an input changes, the next render stops and names the file to delete, so a stale result is never reloaded.
 
 Each script's `steps` table holds the **names** of `.Renviron` variables, never keys:
 
 ```         
-COMPASS_EMBED_URL / COMPASS_EMBED_KEY   embeddings (preprocess, stance)
+COMPASS_EMBED_URL / COMPASS_EMBED_KEY   embeddings (preprocess)
 COMPASS_LARGE_URL / COMPASS_LARGE_KEY   codebook (topics)
-COMPASS_SMALL_URL / COMPASS_SMALL_KEY   stance coding
 ```
 
-Set `use_openrouter = FALSE` in all three scripts and delete `llm_openrouter.R`. Stance must use the same `embed` row as preprocess, or the claim is embedded with a different model than the corpus and the render stops.
+Stance needs no key at work: set `STANCE_URL` and `STANCE_MODEL` in `.Renviron` for `stance.qmd`, and as environment variables on Connect for the app. `STANCE_KEY` is read if set and sent as a bearer token, for a provider that needs one at home; it is never written into a result. Set `use_openrouter = FALSE` in preprocess and topics and delete `llm_openrouter.R` and `stance/try_stance_local.R` at work.
+
+Deployment settings, read at startup:
+
+``` r
+# both apps
+options(drsvyr.classification = "YOUR MARKING")   # the banner above every tab
+# topics
+options(hot_topic.source = "public comments submitted to ...")
+options(hot_topic.docs = "https://github.com/klinares/hot_topic/blob/main")
+options(hot_topic.stance_app = "https://connect/.../stance")  # adds a link to it
+# stance
+options(stance.tested = "English paragraphs from public comments, ...")
+options(stance.docs = "https://github.com/klinares/hot_topic/blob/main/stance/stance.pdf")
+options(stance.max_rows = 10000)        # largest file the app will code
+options(stance.sec_per_passage = 0.1)   # measured rate, for the time estimate
+```
+
+Unset, the banner reads UNCLASSIFIED and the topics text says "public comments". `HOT_TOPIC_DATA` points the topics app at another data folder.
+
+On Posit Connect:
+
+-   publish `topics/` as `app.R` + `R/` + `outputs/`, and `stance/` as `app.R` + `R/`. Uncheck `inputs/`, the `.qmd` files and the PDFs in the publish dialog; they are not needed to serve either app.
+-   for the stance app, set `STANCE_URL` and `STANCE_MODEL`, and set **Max connections per process** to 1: a run holds its R process for as long as it takes, and this keeps it from freezing other users.
+-   plots use Cairo (`options(bitmapType = "cairo")` in both `app.R` files), since the server has no X11.
 
 ## Packages
 
-Scripts: tidyverse, here, viridis, stm, tidytext, splines, furrr, clue, withr, httr2 (1.1 or later), ellmer (0.4 or later), knitr, glue; quanteda only for the demo corpus.
+Scripts: tidyverse, here, viridis, stm, tidytext, splines, furrr, clue, withr, httr2, ellmer (0.4 or later; preprocess and topics only), knitr, glue, arrow; quanteda only for the demo corpus.
 
-App: shiny, bslib, DT, ggplot2, viridisLite, dplyr, purrr, readr, stringr, tibble.
+Apps: shiny, bslib, ggplot2, dplyr, purrr, readr, tibble, withr, splines, httr2; topics also DT, stringr, viridisLite, glue.
 
 ## What the numbers do not include
 
-- **Topic assignment is an estimate.** Each paragraph goes to its most likely topic; AvePP says how cleanly. Entropy R² and AvePP both fall as units get longer, because longer units genuinely mix topics, so use them to compare topics within a fit, not to choose the unit size.
-- **Stance labels come from one model with no human check**, so label error is not in any interval. Read the example paragraphs the render prints before trusting a number, and re-run with a paraphrase of the claim to see whether the result turns on its wording.
-- **Every share is a share of paragraphs**, so a long comment counts more than a short one. These are not shares of commenters.
-- **Trends are smoothed.** Where the tick marks under a stance line thin out, the line is mostly the model interpolating.
+-   **Topic assignment is an estimate.** Each paragraph goes to its most likely topic; AvePP says how cleanly. Entropy R² and AvePP both fall as units get longer, because longer units genuinely mix topics, so use them to compare topics within a fit, not to choose the unit size.
+-   **Stance labels come from one model**, so label error is not in any interval unless you run the hand-coded check. Read the example passages the render prints before trusting a number, and re-run with a paraphrase of the claim to see whether the result turns on its wording.
+-   **Every share is a share of passages**, so a long document counts more than a short one. These are not shares of writers.
+-   **Nothing is weighted.** Both tools describe the corpus in front of them, not a wider population.
+-   **Trends are smoothed.** Where a period holds few passages, the line is mostly the model interpolating; periods under the threshold are left out rather than drawn.
 
 ## Troubleshooting
 
@@ -149,11 +179,13 @@ App: shiny, bslib, DT, ggplot2, viridisLite, dplyr, purrr, readr, stringr, tibbl
 |------------------------------------|------------------------------------|
 | `X changed since Y was built. Delete Y` | an upstream file changed; delete Y and re-render |
 | `N comments could not be embedded. First error: ...` | the provider's own message; re-render, embedded comments are not re-sent |
-| `Every call in the window failed. First error: ...` | the provider's own message; nothing was saved for that window |
-| `N calls failed; re-render to retry them` | partial failure; the successes are saved, re-render sends only the rest |
-| `Set X and Y in .Renviron` | the named variable is empty; restart R after editing .Renviron |
+| `The model could not be reached or did not answer: ...` | check `STANCE_URL`, `STANCE_MODEL`, and that the server can reach the endpoint |
+| `N passages got no label; re-render to retry them` | the successes are saved; re-render sends only the rest |
+| `Set X and Y in .Renviron` / `Set STANCE_URL and STANCE_MODEL` | the named variable is empty; restart R after editing .Renviron |
 | `ellmer 0.4.0 or later is needed` | update ellmer (the key is passed as `credentials`) |
 | `stm_fit.rds has K = a but tx$K = b` | delete `stm_fit.rds` |
-| `The claim was embedded with a different model` | stance's `embed` row differs from preprocess's |
-| stance: `no trend fitted: too few paragraphs` | under `min_class_n` on one side; raise the budget in `n` or read the shares only |
-| app: `could not find function "load_outputs"` | the four helper files are not in `app/R/`, or the app was started from the wrong folder |
+| `sensitivity.parquet` was built at another K | delete `sensitivity.parquet` |
+| stance: `X: no trend, N period(s) with at least 30 passages` | not enough dense periods; read the static estimate instead |
+| stance: `separation: the label is (nearly) certain over part of the range` | that quantity is almost constant; read its overall share |
+| stance: `The time column must be numeric (a year), "YYYY-MM", or a date` | pick another column, or none |
+| app: `could not find function "load_outputs"` | the helper files are not in `R/`, or the app was started from the wrong folder |

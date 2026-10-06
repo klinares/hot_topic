@@ -47,3 +47,11 @@ po/*~
 
 # RStudio Connect folder
 rsconnect/
+
+# Raw data: each project reads its corpus from its own inputs/ folder, which
+# stays off GitHub. Everything the scripts write (CSV, parquet, the STM fit)
+# is small enough to track.
+topics/inputs/*
+stance/inputs/*
+!topics/inputs/.gitkeep
+!stance/inputs/.gitkeep

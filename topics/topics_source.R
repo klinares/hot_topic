@@ -1,19 +1,23 @@
-# llm_source.R: shared functions for preprocess.qmd, topics.qmd, stance.qmd.
+# topics_source.R: shared functions for preprocess.qmd and topics.qmd.
 # Only function definitions live here; nothing runs when it is sourced.
 #   1. Setup and model calls
 #   2. Output guard (manifest.csv)
 #   3. Paragraph units
 #   4. Topic model helpers
-#   5. Topic trends (stance shares and trends: app/R/stance_core.R)
+#   5. Topic trends
 #   6. Tables for Typst
+#
+# Stance lives in its own project (../stance) with its own functions; the two
+# share nothing but the cluster-robust variance below, which is eight lines and
+# not worth a dependency between two apps that deploy separately.
 
 # ---- 1. Setup and model calls ------------------------------------------------
 
 `%||%` <- function(x, y) if (is.null(x) || length(x) == 0) y else x
-# Outputs live inside the app so there is one copy; the stance functions
-# live there too, for the same reason.
-p_out <- function(f) here::here("app", "outputs", f)
-source(here::here("app", "R", "stance_core.R"))
+# The raw corpus goes in topics/inputs; everything the scripts write goes in
+# topics/outputs, which is also where the app reads it.
+p_in <- function(f) here::here("topics", "inputs", f)
+p_out <- function(f) here::here("topics", "outputs", f)
 
 # Every prompt has the same four parts, so each one reads the same way.
 build_prompt <- function(role, task, rules, output) {
@@ -271,7 +275,7 @@ merge_once <- function(u, min_tokens, max_tokens, min_sim) {
 # Merge one comment's blocks until no allowed pair remains. Each step removes
 # one block, so at most (blocks - 1) steps; extra steps change nothing. Units
 # still under min_tokens are kept in the output but flagged keep = FALSE.
-# Each unit carries its vector (vec), which stance.qmd uses for similarity.
+# Each unit carries its vector (vec), kept for the sensitivity refit.
 link_comment <- function(b, E, min_tokens, max_tokens, min_sim) {
   u <- list(text = b$block, n = b$n_tokens, n_blocks = rep(1L, nrow(b)), E = E)
   u <- purrr::reduce(seq_len(max(0, nrow(b) - 1)), function(u, s)
@@ -346,6 +350,17 @@ match_topics <- function(b_ref, b_alt) {
 }
 
 # ---- 5. Trends over time ---------------------------------------------------------
+
+# Standard errors clustered on comment, since paragraphs from one comment are
+# correlated (sandwich estimator written out to avoid a dependency).
+cluster_vcov <- function(model, cluster) {
+  X <- stats::model.matrix(model)
+  u <- stats::residuals(model, type = "working") * stats::weights(model, "working")
+  S <- rowsum(X * u, cluster)
+  G <- nrow(S)
+  bread <- summary(model)$cov.unscaled
+  bread %*% crossprod(S) %*% bread * G / (G - 1)
+}
 
 # Expected share of topic k by year. A fractional logit (quasibinomial glm on
 # the topic share; Papke and Wooldridge 1996) keeps every prediction between

@@ -1,6 +1,6 @@
 ---
 title: "Topics and how they change over time"
-subtitle: "Step 2 of 3. Reads preprocess.qmd outputs"
+subtitle: "Step 2 of 2. Reads preprocess.qmd outputs"
 format:
   typst:
     toc: false
@@ -36,9 +36,9 @@ suppressPackageStartupMessages({
 })
 theme_set(theme_minimal(base_size = 12))
 set.seed(tx$seed)
-source(here::here("code", "llm_source.R"))
+source(here::here("topics", "topics_source.R"))
 if (isTRUE(tx$use_openrouter)) {
-  source(here::here("code", "llm_openrouter.R"))
+  source(here::here("topics", "llm_openrouter.R"))
   tx$steps$model <- open_router_models[tx$steps$step]
 }
 ```
@@ -192,7 +192,7 @@ if (isTRUE(tx$run_sensitivity)) {
 
 # Topic codebook
 
-One call per topic, all in parallel, with the larger model. Each call sees only that topic's evidence: its `r tx$n_words` most distinctive (FREX) and `r tx$n_words` most probable words and its `r tx$n_examples` most typical paragraphs. It drafts a label, a one-sentence description, and a candidate proposition for stance work. The file is written once: if `topic_codebook.csv` exists it is read, not redrafted, so your edits survive. Delete it to redraft.
+One call per topic, all in parallel, with the larger model. Each call sees only that topic's evidence: its `r tx$n_words` most distinctive (FREX) and `r tx$n_words` most probable words and its `r tx$n_examples` most typical paragraphs. It drafts a label, a one-sentence description, and a candidate proposition: a claim, in the form the stance app wants, that a reader could paste in to measure where this topic stands. The file is written once: if `topic_codebook.csv` exists it is read, not redrafted, so your edits survive. Delete it to redraft.
 
 ```{r codebook}
 #| results: asis
@@ -284,6 +284,7 @@ purrr::walk(pages, function(d) print(
 ```{r handoff}
 #| results: asis
 writeLines(glue::glue("Wrote paragraph_theta.csv, topic_summary.csv, \\
-  topic_codebook.csv, topic_trends.csv, stm_fit.rds. \\
-  The app reads the four CSVs from app/outputs/."))
+  topic_codebook.csv, topic_trends.csv, stm_fit.rds to topics/outputs/. \\
+  The app reads the four CSVs. To measure stance on one of the propositions \\
+  above, copy paragraph_theta.csv into stance/inputs/ and read stance.qmd."))
 ```

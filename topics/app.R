@@ -1,6 +1,12 @@
-# app.R: hot_topic dashboard. Reads the four CSVs topics.qmd writes from
+# app.R: the topics dashboard. Reads the four CSVs topics.qmd writes from
 # outputs/ inside this folder. Set HOT_TOPIC_DATA to read them elsewhere.
-# The Stance tab calls the model named by STANCE_URL and STANCE_MODEL.
+#
+# Stance is a separate app (../stance) with its own deployment, because it
+# calls a language model on every run and holds its R process while it does.
+# Nothing here calls a model.
+#
+# On Posit Connect, publish app.R and R/ and outputs/; inputs/ and the .qmd
+# files are not needed to serve the app.
 
 library(shiny)
 options(bitmapType = "cairo")  # the work server has no X11
@@ -22,14 +28,12 @@ ui <- bslib::page(
     title = "hot_topic", id = "nav",
     bslib::nav_panel("Start here", help_ui(hd)),
     bslib::nav_panel("Topics", mod_topics_ui("topics", hd)),
-    bslib::nav_panel("Read", mod_read_ui("read", hd)),
-    bslib::nav_panel("Stance", mod_stance_ui("stance", hd))))
+    bslib::nav_panel("Read", mod_read_ui("read", hd))))
 
 server <- function(input, output, session) {
   help_server(input, output, hd)
   mod_topics_server("topics", hd)
   mod_read_server("read", hd)
-  mod_stance_server("stance", hd)
 }
 
 shinyApp(ui, server)

@@ -1,12 +1,15 @@
 # ui_help.R: the Start here tab, written for a general audience.
 # The source of the text is a deployment setting, like the classification
 # marking: options(hot_topic.source = "public comments submitted to ...").
-# The method reports are the PDFs rendered from code/*.qmd, linked on GitHub;
-# options(hot_topic.docs = "...") points the links elsewhere.
+# The method reports are the PDFs rendered from the .qmd files, linked on
+# GitHub; options(hot_topic.docs = "...") points the links elsewhere, and
+# options(hot_topic.stance_app = "...") points at the stance app if it is
+# deployed, which adds a link to it.
 
 help_ui <- function(hd) {
   src <- getOption("hot_topic.source", "public comments")
-  docs <- getOption("hot_topic.docs", "https://github.com/klinares/hot_topic/blob/main/code")
+  docs <- getOption("hot_topic.docs", "https://github.com/klinares/hot_topic/blob/main")
+  stance_app <- getOption("hot_topic.stance_app", "")
   p <- hd$paras
   n_docs <- dplyr::n_distinct(p$atom_id)
   per_doc <- dplyr::count(p, atom_id)$n
@@ -61,15 +64,19 @@ help_ui <- function(hd) {
         tags$dd("The paragraphs behind a topic. Filter by topic, year, or a word; ",
                 "click a paragraph to read the whole comment it came from; ",
                 "download what you see."),
-        tags$dt("Stance"),
-        tags$dd("Write a claim; a language model reads every paragraph and labels it ",
-                "for or against the claim, and the tab shows how each position moved ",
-                "over time. Download the yearly estimates.")),
+        tags$dt("Propositions"),
+        tags$dd("Each topic carries a draft claim that a paragraph on that topic ",
+                "could agree or disagree with. They are starting points for ",
+                "measuring stance, which is a separate tool: it reads every ",
+                "paragraph and labels it for or against one claim.",
+                if (nzchar(stance_app)) tagList(" ",
+                  tags$a(href = stance_app, target = "_blank",
+                         "Open the stance app")) else NULL)),
       tags$h5("Method reports"),
       tags$ul(purrr::imap(
-        c(preprocess = "How comments were divided into paragraphs",
-          topics = "How topics and their trends were estimated",
-          stance = "How stance is measured"),
+        c("topics/preprocess" = "How comments were divided into paragraphs",
+          "topics/topics" = "How topics and their trends were estimated",
+          "stance/stance" = "How stance is measured, in the separate stance app"),
         function(txt, f) tags$li(tags$a(href = paste0(docs, "/", f, ".pdf"),
                                         target = "_blank", txt)))),
       tags$h5("Reading the numbers"),
