@@ -35,7 +35,7 @@ topics/app.R            dashboard: topics, and the paragraphs behind them
 ```
 
 | Step | What to set | Model calls |
-|------------------------|------------------------|------------------------|
+|----|----|----|
 | 1\. `preprocess.qmd` | your corpus read, `min_tokens`, `max_tokens` | one embedding request per comment, first run only |
 | 2\. `topics.qmd` | `K` (after one `run_searchK` pass) | one per topic, first run only |
 | 3\. `app.R` | nothing | none |
@@ -62,7 +62,7 @@ Read the dropped share, overall and by year, in the render. If it is large or co
 ### topics/outputs/
 
 | File | Written by | What |
-|------------------------|------------------------|------------------------|
+|----|----|----|
 | `paragraphs.csv` | preprocess | the paragraph units, one row each |
 | `dropped_units.csv` | preprocess | units too short to place, for review |
 | `blocks.csv`, `embeddings.parquet`, `merge_settings.parquet` | preprocess | inputs to the sensitivity test |
@@ -98,8 +98,8 @@ Every passage is coded; nothing is sampled.
 
 $$P(\text{favor}) = P(\text{addresses}) \times P(\text{favor} \mid \text{addresses})$$
 
--   **Salience** is the share of *all* passages that address the claim. It says whether the claim is live.
--   **Favor, neutral, oppose** are shares of the passages that *do* address it. They say which way.
+- **Salience** is the share of *all* passages that address the claim. It says whether the claim is live.
+- **Favor, neutral, oppose** are shares of the passages that *do* address it. They say which way.
 
 Reported together they separate a rise in agreement from a rise in attention. The cost is that the direction estimates rest on a smaller base that moves over time, so each basis gets its own period set and the app reports what was dropped.
 
@@ -114,7 +114,7 @@ A time column may be a numeric year, `YYYY-MM`, or a date. Months become `year +
 ### stance/outputs/ (written by stance.qmd only)
 
 | File | What |
-|------------------------|------------------------------------------------|
+|----|----|
 | `stance_labels_NAME.csv` | one label per coded row, keyed by row number |
 | `stance_estimates_NAME.csv` | the estimates with the claim, prompt, model, counts, date |
 | `stance_prompt_NAME.txt` | the exact prompt and model that produced those labels |
@@ -180,9 +180,9 @@ Unset, the banner reads UNCLASSIFIED and the topics text says "public comments".
 
 On Posit Connect:
 
--   publish `topics/` as `app.R` + `R/` + `outputs/`, and `stance/` as `app.R` + `R/`. Uncheck `inputs/`, the `.qmd` files and the PDFs in the publish dialog; they are not needed to serve either app.
--   for the stance app, set `STANCE_URL` and `STANCE_MODEL`, and set **Max connections per process** to 1: a run holds its R process for as long as it takes, and this keeps it from freezing other users.
--   plots use Cairo (`options(bitmapType = "cairo")` in both `app.R` files), since the server has no X11.
+- publish `topics/` as `app.R` + `R/` + `outputs/`, and `stance/` as `app.R` + `R/`. Uncheck `inputs/`, the `.qmd` files and the PDFs in the publish dialog; they are not needed to serve either app.
+- for the stance app, set `STANCE_URL` and `STANCE_MODEL`, and set **Max connections per process** to 1: a run holds its R process for as long as it takes, and this keeps it from freezing other users.
+- plots use Cairo (`options(bitmapType = "cairo")` in both `app.R` files), since the server has no X11.
 
 ## Packages
 
@@ -192,16 +192,16 @@ Apps: shiny, bslib, ggplot2, dplyr, purrr, readr, tibble, withr, splines, httr2;
 
 ## What the numbers do not include
 
--   **Topic assignment is an estimate.** Each paragraph goes to its most likely topic; AvePP says how cleanly. Entropy R² and AvePP both fall as units get longer, because longer units genuinely mix topics, so use them to compare topics within a fit, not to choose the unit size.
--   **Stance labels come from one model**, so label error is not in any interval unless you run the hand-coded check. Read the example passages the render prints before trusting a number, and re-run with a paraphrase of the claim to see whether the result turns on its wording.
--   **Every share is a share of passages**, so a long document counts more than a short one. These are not shares of writers.
--   **Nothing is weighted.** Both tools describe the corpus in front of them, not a wider population.
--   **Trends are smoothed.** Where a period holds few passages, the line is mostly the model interpolating; periods under the threshold are left out rather than drawn.
+- **Topic assignment is an estimate.** Each paragraph goes to its most likely topic; AvePP says how cleanly. Entropy R² and AvePP both fall as units get longer, because longer units genuinely mix topics, so use them to compare topics within a fit, not to choose the unit size.
+- **Stance labels come from one model**, so label error is not in any interval unless you run the hand-coded check. Read the example passages the render prints before trusting a number, and re-run with a paraphrase of the claim to see whether the result turns on its wording.
+- **Every share is a share of passages**, so a long document counts more than a short one. These are not shares of writers.
+- **Nothing is weighted.** Both tools describe the corpus in front of them, not a wider population.
+- **Trends are smoothed.** Where a period holds few passages, the line is mostly the model interpolating; periods under the threshold are left out rather than drawn.
 
 ## Troubleshooting
 
 | Message | Meaning |
-|------------------------------------|------------------------------------|
+|----|----|
 | `X changed since Y was built. Delete Y` | an upstream file changed; delete Y and re-render |
 | `N comments could not be embedded. First error: ...` | the provider's own message; re-render, embedded comments are not re-sent |
 | `The model could not be reached or did not answer: ...` | check `STANCE_URL`, `STANCE_MODEL`, and that the server can reach the endpoint |
