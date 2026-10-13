@@ -1,0 +1,24 @@
+started 2026-10-13 18:47:41 | httr2 1.3.0
+endpoint https://openrouter.ai/api/v1 | model google/gemma-4-31b-it
+corpus: 877 passages in bounds
+1. one passage: irrelevant
+2. 60 passages one at a time: 17.3 s (0.29 s each)
+   90 rows (60 unique) four at a time: 8 s (0.13 s per unique passage)
+   speedup per unique passage: 2.16x
+   labels that differ, sequential vs parallel: 2 of 60
+   copies got their original's label: TRUE
+   NA labels: sequential 0, parallel 0
+   label counts (parallel): favor=5, irrelevant=49, neutral=2, oppose=4
+3. 400 passages four at a time: 53.6 s; 400 labeled
+   static: salience 26.8% [20.5, 34.0] | favor 67.3% [54.2, 78.1] | neutral 15.9% [10.0, 24.3] | oppose 16.8% [9.3, 28.6]
+   trend fitted: FALSE | notes: salience: no trend, 0 period(s) with at least 30 passages (needs 4); favor: no trend, 0 period(s) with at least 30 passages (needs 4); neutral: no trend, 0 period(s) with at least 30 passages (needs 4); oppose: no trend, 0 period(s) with at least 30 passages (needs 4)
+   examples:
+   [FAVOR] If we survey the situation of our Nation both at home and abroad, we find many satisfactions; we find some causes for concern. We have emerged from the losses of the Great War and the reconstruction following it with inc
+   [FAVOR] The aboriginal inhabitants of these countries I have regarded with the commiseration their history inspires. Endowed with the faculties and the rights of men, breathing an ardent love of liberty and independence, and occ
+   [IRRELEVANT] The Chief Magistrate derives all his authority from the people, and they have referred none upon him to fix terms for the separation of the States. The people themselves can do this if also they choose, but the Executive
+   [IRRELEVANT] The time has come for a new American emancipation - a great national drive to tear down economic barriers and liberate the spirit of enterprise in the most distressed areas of our country. My friends, together we can do 
+   [NEUTRAL] Of unity, not division. Of light, not darkness. An American story of decency and dignity. Of love and of healing. Of greatness and of goodness. May this be the story that guides us. The story that inspires us. The story 
+   [NEUTRAL] In too much of the earth there is want, discord, danger. New forces and new nations stir and strive across the earth, with power to bring, by their fate, great good or great evil to the free world's future. From the dese
+   [OPPOSE] If extravagance were not reflected in taxation, and through taxation both directly and indirectly injuriously affecting the people, it would not be of so much consequence. The wisest and soundest method of solving our ta
+   [OPPOSE] Those who nominated and elected me did so with full knowledge that I had made this and many similar declarations and had never recanted them; and more than this, they placed in the platform for my acceptance, and as a la
+finished 2026-10-13 18:49:03 | ok

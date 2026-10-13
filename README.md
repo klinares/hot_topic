@@ -35,7 +35,7 @@ topics/app.R            dashboard: topics, and the paragraphs behind them
 ```
 
 | Step | What to set | Model calls |
-|----|----|----|
+|------------------------|------------------------|------------------------|
 | 1\. `preprocess.qmd` | your corpus read, `min_tokens`, `max_tokens` | one embedding request per comment, first run only |
 | 2\. `topics.qmd` | `K` (after one `run_searchK` pass) | one per topic, first run only |
 | 3\. `app.R` | nothing | none |
@@ -62,7 +62,7 @@ Read the dropped share, overall and by year, in the render. If it is large or co
 ### topics/outputs/
 
 | File | Written by | What |
-|----|----|----|
+|------------------------|------------------------|------------------------|
 | `paragraphs.csv` | preprocess | the paragraph units, one row each |
 | `dropped_units.csv` | preprocess | units too short to place, for review |
 | `blocks.csv`, `embeddings.parquet`, `merge_settings.parquet` | preprocess | inputs to the sensitivity test |
@@ -83,9 +83,11 @@ stance/stance.qmd   one claim over one corpus, with the method written out
 stance/app.R        upload a CSV, write a claim, get labels and estimates
 ```
 
-The app takes a user's own CSV: they point at the text column, optionally at a time column and a document column, write a claim, and every row is coded. They download their file with a `stance` column added, the estimates, and a sheet of 400 passages to code by hand as a check. Nothing is written to the server's disk and nothing is read from `outputs/`.
+The app takes a user's own CSV: they point at the text column, optionally at a time column and a document column, write a claim, and every row is coded. They download their file with a `stance` column added, the estimates, and a sheet of 400 passages to code by hand as a check. There is no limit on the number of rows. Nothing is written to the server's disk and nothing is read from `outputs/`.
 
-`shiny::runApp("stance")` from the repo root. Three pages: **Start here** (how to prepare a file, what the tool has been tried on, and what it does not measure), **Detect stance** (the run), **Check the labels** (hand codes in, agreement out).
+`shiny::runApp("stance")` from the repo root. Three pages: **Start here** (what the method is and why, how to use the tool and shape a file for it, a flowchart, and how to write a claim, following Li and Conrad 2024), **Detect stance** (the run and the three downloads), **Check the labels** (the labeled file and the coded sheet in, agreement out).
+
+**The check is stateless.** Every file of a run carries the same run id (`stance_run`, e.g. `run-20261013-180601-1f3a`) and row number (`stance_row`). An analyst can download the files, code the sheet over days, and come back to a new session: Check the labels takes the labeled file and the coded sheet, refuses them if their run ids differ, and matches the rows. Sorting or re-saving either file in a spreadsheet does not break the match. Both are written as UTF-8 with a byte-order mark so a spreadsheet opens them cleanly.
 
 To run the documented version over a corpus: put the CSV in `stance/inputs/`, name it and its columns in the config chunk at the top of `stance.qmd`, write the claim, and render. For the topics corpus, that CSV is `topics/outputs/paragraph_theta.csv`. Rendering also writes `stance/stance.pdf`, which both apps link to.
 
@@ -93,13 +95,13 @@ To run the documented version over a corpus: put the CSV in `stance/inputs/`, na
 
 Every passage is coded; nothing is sampled.
 
-1.  **Code.** Each passage goes alone to the model named by `STANCE_URL` and `STANCE_MODEL`, one request at a time, at temperature 0, without its date or its document. The reply is one of favor, neutral, oppose, or irrelevant (does not address the claim). The first passage is a probe: if the model cannot be reached, the run stops at once with the reason.
+1.  **Code.** Each passage goes alone to the model named by `STANCE_URL` and `STANCE_MODEL`, one request per passage, `stance.workers` requests at a time, at temperature 0, without its date or its document. Requests go out in chunks of ten per worker, so the progress bar moves during a parallel run; each passage is still its own request, so the labels do not depend on how many run at once (needs httr2 1.1.1 or later). Identical passages are sent once and the label copied to every copy; each copy still counts as its own passage in the estimates, so a form letter sent by 500 people counts 500 times. The reply is one of favor, neutral, oppose, or irrelevant (does not address the claim). The first passage is a probe: if the model cannot be reached, the run stops at once with the reason.
 2.  **Estimate.** Four quantities, because a share of all passages confounds two different things:
 
 $$P(\text{favor}) = P(\text{addresses}) \times P(\text{favor} \mid \text{addresses})$$
 
-- **Salience** is the share of *all* passages that address the claim. It says whether the claim is live.
-- **Favor, neutral, oppose** are shares of the passages that *do* address it. They say which way.
+-   **Salience** is the share of *all* passages that address the claim. It says whether the claim is live.
+-   **Favor, neutral, oppose** are shares of the passages that *do* address it. They say which way.
 
 Reported together they separate a rise in agreement from a rise in attention. The cost is that the direction estimates rest on a smaller base that moves over time, so each basis gets its own period set and the app reports what was dropped.
 
@@ -109,12 +111,12 @@ Only passages between 5 and 250 words are coded. Rows outside the bounds are rep
 
 A time column may be a numeric year, `YYYY-MM`, or a date. Months become `year + (month - 1) / 12`, so one unit of time is one year either way.
 
-`stance.qmd` saves labels every `save_every` passages and resumes where it stopped. The app keeps nothing: it shows the estimates and offers them as a CSV that records the claim, the full prompt, the model, the endpoint, the counts, and the date.
+`stance.qmd` saves labels every `save_every` passages and resumes where it stopped; `st$workers` sets its parallel requests, as `st$workers` does in `unga/stance.R`. The app keeps nothing: it shows the estimates and offers them as a CSV that records the claim, the full prompt, the model, the endpoint, the counts, and the date.
 
 ### stance/outputs/ (written by stance.qmd only)
 
 | File | What |
-|----|----|
+|------------------------|------------------------------------------------|
 | `stance_labels_NAME.csv` | one label per coded row, keyed by row number |
 | `stance_estimates_NAME.csv` | the estimates with the claim, prompt, model, counts, date |
 | `stance_prompt_NAME.txt` | the exact prompt and model that produced those labels |
@@ -172,7 +174,7 @@ options(hot_topic.stance_app = "https://connect/.../stance")  # adds a link to i
 # stance
 options(stance.tested = "English paragraphs from public comments, ...")
 options(stance.docs = "https://github.com/klinares/hot_topic/blob/main/stance/stance.pdf")
-options(stance.max_rows = 10000)        # largest file the app will code
+options(stance.workers = 4L)            # requests sent to the model at once (in app.R)
 options(stance.sec_per_passage = 0.1)   # measured rate, for the time estimate
 ```
 
@@ -180,28 +182,28 @@ Unset, the banner reads UNCLASSIFIED and the topics text says "public comments".
 
 On Posit Connect:
 
-- publish `topics/` as `app.R` + `R/` + `outputs/`, and `stance/` as `app.R` + `R/`. Uncheck `inputs/`, the `.qmd` files and the PDFs in the publish dialog; they are not needed to serve either app.
-- for the stance app, set `STANCE_URL` and `STANCE_MODEL`, and set **Max connections per process** to 1: a run holds its R process for as long as it takes, and this keeps it from freezing other users.
-- plots use Cairo (`options(bitmapType = "cairo")` in both `app.R` files), since the server has no X11.
+-   publish `topics/` as `app.R` + `R/` + `outputs/`, and `stance/` as `app.R` + `R/`. Uncheck `inputs/`, the `.qmd` files and the PDFs in the publish dialog; they are not needed to serve either app.
+-   for the stance app, set `STANCE_URL` and `STANCE_MODEL`, and set **Max connections per process** to 1: a run holds its R process for as long as it takes, and this keeps it from freezing other users.
+-   plots use Cairo (`options(bitmapType = "cairo")` in both `app.R` files), since the server has no X11.
 
 ## Packages
 
 Scripts: tidyverse, here, viridis, stm, tidytext, splines, furrr, clue, withr, httr2, ellmer (0.4 or later; the embedding and codebook steps only), knitr, glue, arrow; quanteda only for the demo corpus.
 
-Apps: shiny, bslib, ggplot2, dplyr, purrr, readr, tibble, withr, splines, httr2; topics also DT, stringr, viridisLite, glue.
+Apps: shiny, bslib, ggplot2, dplyr, purrr, readr, tibble, withr, splines, httr2 (1.1.1 or later for parallel requests); topics also DT, stringr, viridisLite, glue.
 
 ## What the numbers do not include
 
-- **Topic assignment is an estimate.** Each paragraph goes to its most likely topic; AvePP says how cleanly. Entropy R² and AvePP both fall as units get longer, because longer units genuinely mix topics, so use them to compare topics within a fit, not to choose the unit size.
-- **Stance labels come from one model**, so label error is not in any interval unless you run the hand-coded check. Read the example passages the render prints before trusting a number, and re-run with a paraphrase of the claim to see whether the result turns on its wording.
-- **Every share is a share of passages**, so a long document counts more than a short one. These are not shares of writers.
-- **Nothing is weighted.** Both tools describe the corpus in front of them, not a wider population.
-- **Trends are smoothed.** Where a period holds few passages, the line is mostly the model interpolating; periods under the threshold are left out rather than drawn.
+-   **Topic assignment is an estimate.** Each paragraph goes to its most likely topic; AvePP says how cleanly. Entropy R² and AvePP both fall as units get longer, because longer units genuinely mix topics, so use them to compare topics within a fit, not to choose the unit size.
+-   **Stance labels come from one model**, so label error is not in any interval unless you run the hand-coded check. Read the example passages the render prints before trusting a number, and re-run with a paraphrase of the claim to see whether the result turns on its wording.
+-   **Every share is a share of passages**, so a long document counts more than a short one. These are not shares of writers.
+-   **Nothing is weighted.** Both tools describe the corpus in front of them, not a wider population.
+-   **Trends are smoothed.** Where a period holds few passages, the line is mostly the model interpolating; periods under the threshold are left out rather than drawn.
 
 ## Troubleshooting
 
 | Message | Meaning |
-|----|----|
+|------------------------------------|------------------------------------|
 | `X changed since Y was built. Delete Y` | an upstream file changed; delete Y and re-render |
 | `N comments could not be embedded. First error: ...` | the provider's own message; re-render, embedded comments are not re-sent |
 | `The model could not be reached or did not answer: ...` | check `STANCE_URL`, `STANCE_MODEL`, and that the server can reach the endpoint |
@@ -213,6 +215,9 @@ Apps: shiny, bslib, ggplot2, dplyr, purrr, readr, tibble, withr, splines, httr2;
 | stance: `X: no trend, N period(s) with at least 30 passages` | not enough dense periods; read the static estimate instead |
 | stance: `separation: the label is (nearly) certain over part of the range` | that quantity is almost constant; read its overall share |
 | stance: `The time column must be numeric (a year), "YYYY-MM", or a date` | pick another column, or none |
+| `httr2 1.1.1 or later is needed to send requests in parallel` | update httr2 on the machine or server running it |
+| check: `The two files come from different runs` | the labeled file and the sheet must come from the same run; download them together |
+| check: `No row of the sheet has a hand_label yet` | the sheet was uploaded before it was coded, or the column was renamed |
 | unga: `No paragraph of topic K with country = X` | check the spelling of the country as it is in the data, or pick another topic |
 | request fails with HTTP 401 at home | `STANCE_KEY` is empty; see Running at home |
 | app: `could not find function "load_outputs"` | the helper files are not in `R/`, or the app was started from the wrong folder |

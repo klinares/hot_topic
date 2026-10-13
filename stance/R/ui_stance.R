@@ -1,14 +1,17 @@
 # ui_stance.R: the two working pages. "Detect stance" uploads a CSV, codes
-# every passage, and offers the labels and estimates; "Check the labels" takes
-# hand codes for 400 of them back and compares. Both are served by one
-# moduleServer, so the check works on the run that is open.
+# every passage, and offers three files: the labels, the estimates, and a
+# sheet of 400 passages to code by hand. "Check the labels" takes two of those
+# back, the labeled file and the coded sheet, possibly days later, and
+# compares them. The app remembers nothing between the two: every file of a
+# run carries the same run id, and the check matches on it.
 #
 # Nothing is written to the server's disk: the uploaded file lives in the
 # session, and results leave through the download buttons.
 #
 # A run holds its R process for as long as it takes. On Posit Connect, set
 # "Max connections per process" to 1 so one user's run never freezes another
-# user's session.
+# user's session. options(stance.workers = n) in app.R sets how many requests
+# go to the model at once.
 
 stance_examples <- c(
   "The proposed rule should be withdrawn.",
@@ -42,10 +45,16 @@ mod_stance_ui <- function(id) {
       uiOutput(ns("ready")),
       actionButton(ns("go"), "Detect stance", class = "btn-primary w-100"),
       tags$hr(),
+      tags$h5("4. Download"),
       downloadButton(ns("dl_data"), "Your file with labels (CSV)",
                      class = "btn-outline-secondary w-100 mb-2"),
       downloadButton(ns("dl_est"), "Estimates (CSV)",
-                     class = "btn-outline-secondary w-100")),
+                     class = "btn-outline-secondary w-100 mb-2"),
+      downloadButton(ns("dl_sheet"), "400 passages to code by hand (CSV)",
+                     class = "btn-outline-secondary w-100"),
+      tags$p(class = "small text-muted mt-2",
+             "Keep the file with labels. To check the labels later, you upload it ",
+             "again together with the coded sheet; the app keeps nothing.")),
     uiOutput(ns("preview")),
     bslib::card(
       bslib::card_header(textOutput(ns("title"), inline = TRUE)),
@@ -64,22 +73,22 @@ mod_stance_check_ui <- function(id) {
   bslib::layout_sidebar(
     sidebar = bslib::sidebar(
       width = 400,
-      tags$h5("1. Get the sheet"),
-      downloadButton(ns("dl_sheet"), "400 passages to code (CSV)",
-                     class = "btn-primary w-100"),
-      tags$p(class = "small text-muted mt-2",
-             "Drawn at random from the passages that were coded. The model's ",
-             "label is not in the file, so it cannot anchor you."),
-      tags$h5("2. Code them by hand"),
+      tags$h5("1. Code the sheet by hand"),
       tags$p(class = "small",
-             "Put one of ", tags$code("favor"), ", ", tags$code("neutral"), ", ",
+             "Open the sheet of 400 passages from Detect stance. Put one of ",
+             tags$code("favor"), ", ", tags$code("neutral"), ", ",
              tags$code("oppose"), ", ", tags$code("irrelevant"),
              " in the ", tags$code("hand_label"), " column. Judge the same claim, ",
              "by the same rules the model was given. Leave a row blank to skip it. ",
-             "Keep the ", tags$code("stance_row"), " column as it is."),
-      tags$h5("3. Upload your codes"),
-      fileInput(ns("hand"), NULL, accept = c(".csv", "text/csv"),
-                buttonLabel = "CSV file", placeholder = "no file")),
+             "Do not change ", tags$code("stance_run"), " or ", tags$code("stance_row"), "."),
+      tags$h5("2. Upload both files"),
+      fileInput(ns("labeled"), "Your file with labels", accept = c(".csv", "text/csv"),
+                buttonLabel = "CSV file", placeholder = "from Detect stance"),
+      fileInput(ns("hand"), "Your coded sheet", accept = c(".csv", "text/csv"),
+                buttonLabel = "CSV file", placeholder = "with hand_label filled in"),
+      tags$p(class = "small text-muted",
+             "The two are matched on the run id and row number they both carry, ",
+             "so they must come from the same run. Any day will do.")),
     bslib::card(
       bslib::card_header("Why 400"),
       tags$p("400 hand codes put the overall agreement within about 5 ",
@@ -115,7 +124,7 @@ mod_stance_check_ui <- function(id) {
 mod_stance_server <- function(id) {
   moduleServer(id, function(input, output, session) {
     d0 <- stance_defaults
-    max_rows <- getOption("stance.max_rows", 10000L)
+    workers <- max(1L, as.integer(getOption("stance.workers", 1L)))
     sec_each <- getOption("stance.sec_per_passage", 0.1)
 
     purrr::iwalk(stance_examples, function(x, i)
@@ -208,12 +217,13 @@ mod_stance_server <- function(id) {
       n <- sum(p$keep)
       if (n == 0) return(tags$p(class = "small text-danger",
                                 "No row is within the word bounds."))
-      if (n > max_rows) return(tags$p(class = "small text-danger", sprintf(
-        "%s passages is more than this app will code in one run (%s). Split the file.",
-        format(n, big.mark = ","), format(max_rows, big.mark = ","))))
+      n_u <- dplyr::n_distinct(p$text[p$keep])  # duplicates are sent once
+      # one request per passage, `workers` at a time; the estimate assumes the
+      # server keeps up, which it may not
       tags$p(class = "small text-muted", sprintf(
-        "%s passages, one request each: about %s. Keep this tab open.",
-        format(n, big.mark = ","), fmt_dur(n * sec_each)))
+        "%s passages, %s unique, one request each, %d at a time: about %s. Keep this tab open.",
+        format(n, big.mark = ","), format(n_u, big.mark = ","), workers,
+        fmt_dur(n_u * sec_each / workers)))
     })
 
     # ---- the run -------------------------------------------------------------
@@ -229,8 +239,8 @@ mod_stance_server <- function(id) {
         showNotification("Write the claim as a full sentence.", type = "warning")
         return()
       }
-      if (!sum(p$keep) || sum(p$keep) > max_rows) {
-        showNotification("Nothing to code, or too many rows.", type = "warning")
+      if (!sum(p$keep)) {
+        showNotification("No passage is within the word bounds.", type = "warning")
         return()
       }
       ep <- tryCatch(stance_endpoint(), error = function(e) {
@@ -241,14 +251,13 @@ mod_stance_server <- function(id) {
       todo <- dplyr::filter(p, keep)
       prompt <- stance_prompt(prop, trimws(input$kind %||% "") %|_|%
                                 "short text passages")
-      every <- max(1L, nrow(todo) %/% 100L)
       t0 <- Sys.time()
+      # code_all reports after every chunk of requests, so the bar moves while
+      # they run in parallel
       lab <- withProgress(message = "Reading passages", value = 0, tryCatch(
-        code_all(todo$text, prompt, ep, on_step = function(i, n)
-          if (i %% every == 0L || i == n)
-            setProgress(i / n, detail = sprintf("%s of %s",
-                                                format(i, big.mark = ","),
-                                                format(n, big.mark = ",")))),
+        code_all(todo$text, prompt, ep, workers, on_step = function(i, n)
+          setProgress(i / n, detail = sprintf("%s of %s unique", format(i, big.mark = ","),
+                                              format(n, big.mark = ",")))),
         error = function(e) {
           showNotification(conditionMessage(e), type = "error", duration = NULL)
           NULL
@@ -261,8 +270,9 @@ mod_stance_server <- function(id) {
       counts <- list(total = nrow(p), coded = nrow(coded),
                      excluded = sum(!p$keep) + sum(is.na(todo$label)),
                      documents = dplyr::n_distinct(coded$cluster))
+      run_id <- stance_run_id()
       labeled <- raw() |>
-        dplyr::mutate(stance_row = dplyr::row_number()) |>
+        dplyr::mutate(stance_run = run_id, stance_row = dplyr::row_number()) |>
         dplyr::left_join(dplyr::select(todo, stance_row, stance = label),
                          by = "stance_row") |>
         dplyr::left_join(dplyr::select(p, stance_row, stance_words = n_words,
@@ -277,7 +287,7 @@ mod_stance_server <- function(id) {
                labeled = labeled,
                estimates = stance_record(stance_table(static, trends), prop,
                                          prompt, ep, counts),
-               sheet = stance_sheet(coded, prop)))
+               sheet = stance_sheet(coded, prop, run_id)))
     })
 
     # ---- results -------------------------------------------------------------
@@ -345,7 +355,7 @@ mod_stance_server <- function(id) {
     # ---- downloads -----------------------------------------------------------
     output$dl_data <- downloadHandler(
       filename = function() paste0("stance_labels_", stamp(), ".csv"),
-      content = function(file) readr::write_csv(req(run())$labeled, file))
+      content = function(file) readr::write_excel_csv(req(run())$labeled, file, na = ""))
 
     output$dl_est <- downloadHandler(
       filename = function() paste0("stance_estimates_", stamp(), ".csv"),
@@ -353,58 +363,49 @@ mod_stance_server <- function(id) {
 
     output$dl_sheet <- downloadHandler(
       filename = function() paste0("stance_handcode_", stamp(), ".csv"),
-      content = function(file) readr::write_csv(req(run())$sheet, file))
+      content = function(file) readr::write_excel_csv(req(run())$sheet, file, na = ""))
 
     # ---- the hand-coded check ------------------------------------------------
+    # Built only from the two uploads, so it works in any later session.
+    read_up <- function(f) tryCatch(
+      readr::read_csv(f$datapath, show_col_types = FALSE, progress = FALSE,
+                      col_types = readr::cols(.default = readr::col_character())),
+      error = function(e) e)
     check <- reactive({
-      f <- req(input$hand)
-      r <- run()
-      if (is.null(r)) {
-        showNotification("Run a claim on the Detect stance page first.",
-                         type = "warning")
-        return(NULL)
+      lf <- req(input$labeled)
+      hf <- req(input$hand)
+      fail <- function(msg) {
+        showNotification(msg, type = "error", duration = NULL)
+        NULL
       }
-      h <- tryCatch(readr::read_csv(f$datapath, show_col_types = FALSE,
-                                    progress = FALSE), error = function(e) e)
-      if (inherits(h, "error")) {
-        showNotification(paste("The file could not be read:", conditionMessage(h)),
-                         type = "error", duration = NULL)
-        return(NULL)
-      }
-      if (!all(c("stance_row", "hand_label") %in% names(h))) {
-        showNotification("That file needs the stance_row and hand_label columns from the sheet.",
-                         type = "error", duration = NULL)
-        return(NULL)
-      }
-      h <- h |>
-        dplyr::transmute(stance_row = as.integer(stance_row),
-                         hand_label = tolower(trimws(as.character(hand_label)))) |>
-        dplyr::filter(!is.na(stance_row), !is.na(hand_label), nzchar(hand_label))
-      bad <- setdiff(unique(h$hand_label), stance_labels)
-      if (length(bad))
+      labeled <- read_up(lf)
+      sheet <- read_up(hf)
+      if (inherits(labeled, "error")) return(fail(paste("The labeled file could not be read:",
+                                                      conditionMessage(labeled))))
+      if (inherits(sheet, "error")) return(fail(paste("The sheet could not be read:",
+                                                    conditionMessage(sheet))))
+      m <- tryCatch(stance_match(labeled, sheet), error = function(e) e)
+      if (inherits(m, "error")) return(fail(conditionMessage(m)))
+      if (length(attr(m, "ignored")))
         showNotification(paste("Ignoring labels that are not one of the four:",
-                               paste(bad, collapse = ", ")), type = "warning",
-                         duration = NULL)
-      j <- dplyr::inner_join(h, dplyr::select(r$coded, stance_row, label, cluster),
-                             by = "stance_row")
-      if (!nrow(j)) {
-        showNotification("No stance_row in that file matches the current run.",
-                         type = "error", duration = NULL)
-        return(NULL)
-      }
-      a <- tryCatch(stance_agreement(j$hand_label, j$label, j$cluster),
+                               paste(attr(m, "ignored"), collapse = ", ")),
+                         type = "warning", duration = NULL)
+      a <- tryCatch(stance_agreement(m$hand_label, m$label, m$document),
                     error = function(e) e)
-      if (inherits(a, "error")) {
-        showNotification(conditionMessage(a), type = "error", duration = NULL)
-        return(NULL)
-      }
-      a
+      if (inherits(a, "error")) return(fail(conditionMessage(a)))
+      c(a, list(run = attr(m, "run"), claim = attr(m, "claim"),
+                model = attr(m, "model"), date = attr(m, "date")))
     })
 
     output$agree <- renderUI({
       a <- req(check())
       k <- a$kappa
       tagList(
+        tags$p(class = "small",
+               tags$strong("Claim: "), tags$em(a$claim %|_|% "not recorded"), tags$br(),
+               tags$strong("Model: "), a$model %|_|% "not recorded", " | ",
+               tags$strong("Run: "), a$run, " | ", tags$strong("Coded on: "),
+               a$date %|_|% "not recorded"),
         bslib::layout_columns(
           bslib::value_box("Passages", format(a$n, big.mark = ",")),
           bslib::value_box("Agreement", pct(a$agree),

@@ -49,7 +49,7 @@ Writes to `unga/outputs/stance/`, named `NAME_topicK_BY_VALUE`:
 | `_prompt.txt` | the exact prompt and model behind those labels |
 | `_estimates.csv` | the estimates, with topic, filter, claim, prompt, model, counts, paragraphs after the cutoff, and date |
 
-Labels are saved every `save_every` paragraphs. If the claim, the model, or the topic model changes, the run stops and names the file to delete.
+`workers` sets how many requests go to the model at once; at 20,000 to 100,000 paragraphs it is what decides the run time. Labels are saved every `save_every` paragraphs. If the claim, the model, or the topic model changes, the run stops and names the file to delete.
 
 `run_stance(st)` and `plot_stance(res)` are plain functions. Sourced at top level the file runs; sourced with `local = TRUE` (as a Shiny server would) it only defines them.
 

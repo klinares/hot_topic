@@ -27,11 +27,13 @@ paras <- dplyr::filter(stance_prepare(raw, "text", "Year", "atom_id"), keep)
 one <- code_one(paras$text[1], prompt, ep)
 one
 
-# 2. Twenty passages, timed, to estimate a full run.
-t <- system.time(lab <- code_all(paras$text[1:20], prompt, ep))
-table(lab, useNA = "ifany")
-message(sprintf("%.2f s per passage; all %d would take about %.0f minutes.",
-                t[["elapsed"]] / 20, nrow(paras), t[["elapsed"]] / 20 * nrow(paras) / 60))
+# 2. Forty passages, one at a time and then four at a time, to see what
+#    parallel requests buy on this server before setting stance.workers.
+t1 <- system.time(lab1 <- code_all(paras$text[1:40], prompt, ep, workers = 1))
+t4 <- system.time(lab4 <- code_all(paras$text[1:40], prompt, ep, workers = 4))
+table(lab4, useNA = "ifany")
+message(sprintf("%.2f s per passage one at a time, %.2f s four at a time; %d labels differ.",
+                t1[["elapsed"]] / 40, t4[["elapsed"]] / 40, sum(lab1 != lab4, na.rm = TRUE)))
 
 # 3. A whole estimate without the model, to check the shares, trends, plots,
 #    and period rules on labels drawn at random.

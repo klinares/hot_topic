@@ -72,9 +72,9 @@ stance_screen <- function(text, min_words = stance_defaults$min_words,
                            TRUE ~ NA_character_))
 }
 
-# One passage, one request. Returns the label, or NA with the reason attached
-# when the call fails or the reply holds no label.
-code_one <- function(text, prompt, ep) {
+# One request: the claim's prompt as the system message, the passage as the
+# user message, temperature 0, a reply of a few words.
+stance_request <- function(text, prompt, ep) {
   req <- httr2::request(ep$url) |>
     httr2::req_url_path_append("chat/completions") |>
     httr2::req_body_json(list(
@@ -84,31 +84,57 @@ code_one <- function(text, prompt, ep) {
     httr2::req_timeout(120) |>
     httr2::req_retry(max_tries = 3)
   if (nzchar(ep$key %||% "")) req <- httr2::req_auth_bearer_token(req, ep$key)
-  resp <- tryCatch(httr2::req_perform(req), error = function(e) e)
+  req
+}
+
+# A response to a label: the first label word in the reply, or NA with the
+# reason attached when the call failed or the reply holds no label.
+stance_parse <- function(resp) {
   if (inherits(resp, "error")) return(structure(NA_character_, error = conditionMessage(resp)))
   reply <- tolower(httr2::resp_body_json(resp)$choices[[1]]$message$content %||% "")
   hit <- regmatches(reply, regexpr(paste(stance_labels, collapse = "|"), reply))
   if (length(hit)) hit else structure(NA_character_, error = paste0("no label in reply: \"", reply, "\""))
 }
 
-# Every passage in order. on_step(i, n) runs after each one, for a progress
-# bar. The first passage is a probe: if it fails, the run stops with the reason
-# rather than working through a corpus it cannot reach.
-code_all <- function(text, prompt, ep, on_step = function(i, n) NULL) {
-  n <- length(text)
-  if (n == 0) stop("No passage to code.")
-  probe <- code_one(text[[1]], prompt, ep)
+code_one <- function(text, prompt, ep)
+  stance_parse(tryCatch(httr2::req_perform(stance_request(text, prompt, ep)),
+                        error = function(e) e))
+
+# Every passage, `workers` requests at a time. Identical passages are sent
+# once and the label is copied to every copy, since the same text with the same
+# prompt at temperature 0 gets the same label; each copy still counts as its
+# own passage in the estimates. The first unique passage goes alone as a
+# probe: if it fails, the run stops with the reason rather than working through
+# a corpus it cannot reach. The rest go in chunks of 10 x workers, and
+# on_step(done, n) runs after each chunk, counting unique passages, so a
+# progress bar moves while the requests run in parallel.
+code_all <- function(text, prompt, ep, workers = 1L, on_step = function(i, n) NULL) {
+  if (length(text) == 0) stop("No passage to code.")
+  if (utils::packageVersion("httr2") < "1.1.1")
+    stop("httr2 1.1.1 or later is needed to send requests in parallel.")
+  workers <- max(1L, as.integer(workers))
+  u <- unique(text)
+  n <- length(u)
+  probe <- code_one(u[[1]], prompt, ep)
   if (is.na(probe) && !startsWith(attr(probe, "error"), "no label"))
     stop("The model could not be reached or did not answer: ", attr(probe, "error"))
-  res <- purrr::imap(unname(text), function(t, i) {
-    r <- if (i == 1L) probe else code_one(t, prompt, ep)
-    on_step(i, n)
-    r
+  on_step(1L, n)
+  rest <- seq_len(n)[-1]
+  chunks <- split(rest, ceiling(seq_along(rest) / (10L * workers)))
+  res <- purrr::map(chunks, function(i) {
+    reqs <- purrr::map(u[i], function(t) stance_request(t, prompt, ep))
+    out <- purrr::map(httr2::req_perform_parallel(reqs, on_error = "continue",
+                                                  max_active = workers,
+                                                  progress = FALSE),
+                      stance_parse)
+    on_step(max(i), n)
+    out
   })
+  res <- c(list(probe), unlist(unname(res), recursive = FALSE))
   lab <- purrr::map_chr(res, function(r) as.character(r))
   if (all(is.na(lab)))
     stop("No passage was labeled. First problem: ", attr(res[[1]], "error"))
-  lab
+  lab[match(text, u)]
 }
 
 # A table of passages to code, from a file and the names of its columns. Both
@@ -320,14 +346,56 @@ stance_table <- function(static, trends = NULL) {
     dplyr::mutate(estimate = "static", period = NA_character_, time = NA_real_)
 }
 
+# A label for one run, written into every file the run produces. The hand-coded
+# sheet and the labeled file are matched on it later, so the check needs
+# nothing but the two files. Letters keep spreadsheets from reading it as a
+# number.
+stance_run_id <- function() paste0("run-", format(Sys.time(), "%Y%m%d-%H%M%S"), "-",
+                                   sprintf("%04x", sample.int(65535L, 1L)))
+
 # n coded passages drawn at random to code by hand. The model's label is not in
 # the file, so it cannot anchor the coder. The same run gives the same sheet.
-stance_sheet <- function(coded, proposition, n = 400L, seed = 2026L) {
+stance_sheet <- function(coded, proposition, run = NA_character_, n = 400L, seed = 2026L) {
   withr::with_seed(seed, dplyr::slice_sample(coded, n = min(n, nrow(coded)))) |>
     dplyr::arrange(stance_row) |>
-    dplyr::transmute(stance_row, document = cluster,
+    dplyr::transmute(stance_run = run, stance_row, document = cluster,
                      period = if ("period" %in% names(coded)) period else NA_character_,
                      text, hand_label = "", claim = proposition)
+}
+
+# Hand codes against the model's labels, from the two files an analyst brings
+# back: the labeled file the run produced and the sheet they coded. They are
+# matched on run and row, and refused if they come from different runs.
+# Returns the matched rows (hand_label, label, document) and the run's claim
+# and model, or stops with a message that says what is wrong.
+stance_match <- function(labeled, sheet) {
+  need_l <- c("stance_run", "stance_row", "stance")
+  need_s <- c("stance_run", "stance_row", "hand_label")
+  miss <- c(setdiff(need_l, names(labeled)), setdiff(need_s, names(sheet)))
+  if (length(miss))
+    stop("Missing column(s): ", paste(unique(miss), collapse = ", "), ". Upload the ",
+         "labeled file from Detect stance and the hand-coding sheet from the same run.")
+  run_l <- unique(stats::na.omit(as.character(labeled$stance_run)))
+  run_s <- unique(stats::na.omit(as.character(sheet$stance_run)))
+  if (length(run_l) != 1 || length(run_s) != 1 || run_l != run_s)
+    stop("The two files come from different runs (labels: ",
+         paste(run_l, collapse = ", "), "; sheet: ", paste(run_s, collapse = ", "), ").")
+  hand <- sheet |>
+    dplyr::transmute(stance_row = as.integer(stance_row),
+                     document = if ("document" %in% names(sheet)) as.character(document) else
+                       paste0("row ", stance_row),
+                     hand_label = tolower(trimws(as.character(hand_label)))) |>
+    dplyr::filter(!is.na(hand_label), nzchar(hand_label))
+  if (!nrow(hand)) stop("No row of the sheet has a hand_label yet.")
+  bad <- setdiff(unique(hand$hand_label), stance_labels)
+  m <- dplyr::inner_join(hand, dplyr::transmute(labeled, stance_row = as.integer(stance_row),
+                                                label = as.character(stance)),
+                         by = "stance_row") |>
+    dplyr::filter(hand_label %in% stance_labels, !is.na(label))
+  if (!nrow(m)) stop("No hand-coded row matches a labeled row.")
+  first <- function(col) if (col %in% names(labeled)) as.character(labeled[[col]][1]) else NA_character_
+  structure(m, run = run_l, claim = first("stance_claim"), model = first("stance_model"),
+            date = first("stance_date"), ignored = bad)
 }
 
 # The estimates with the record of what produced them, one row per estimate

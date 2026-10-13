@@ -28,6 +28,7 @@ st <- list(
   min_periods = 10L,
   df_spline = 2L,  # flexibility of the trend; years span decades, so try 3 too
   max_words = 250L,  # longer paragraphs are reported and left uncoded
+  workers = 4L,  # requests sent to the model at once; 1 sends them one by one
   save_every = 100L)  # labels are saved after this many paragraphs
 
 suppressPackageStartupMessages(library(tidyverse))
@@ -66,13 +67,18 @@ run_stance <- function(st) {
     tibble::tibble(para_uid = character(), label = character())
   todo <- dplyr::anti_join(dplyr::filter(pool, keep), done, by = "para_uid")
   if (nrow(todo)) {
-    pb <- utils::txtProgressBar(max = nrow(todo), style = 3, file = stderr())
-    chunks <- split(todo, ceiling(seq_len(nrow(todo)) / st$save_every))
+    # identical paragraphs are sent once: chunks are of unique texts, and each
+    # label is copied to every paragraph that carries that text
+    texts <- unique(todo$text)
+    pb <- utils::txtProgressBar(max = length(texts), style = 3, file = stderr())
+    chunks <- split(texts, ceiling(seq_along(texts) / st$save_every))
     done <- purrr::reduce(seq_along(chunks), function(done, i) {
-      d <- chunks[[i]]
-      lab <- code_all(d$text, prompt, ep, on_step = function(j, n)
+      u <- chunks[[i]]
+      lab <- code_all(u, prompt, ep, st$workers, on_step = function(j, n)
         utils::setTxtProgressBar(pb, (i - 1) * st$save_every + j))
-      out <- dplyr::bind_rows(done, tibble::tibble(para_uid = d$para_uid, label = lab)) |>
+      d <- dplyr::filter(todo, text %in% u)
+      out <- dplyr::bind_rows(done, tibble::tibble(para_uid = d$para_uid,
+                                                   label = lab[match(d$text, u)])) |>
         dplyr::filter(!is.na(label))
       arrow::write_parquet(out, labels_path)
       record_inputs(labels_path, c(theta_in, prompt_path))
