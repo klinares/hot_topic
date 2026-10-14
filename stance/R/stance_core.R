@@ -2,12 +2,16 @@
 # and by stance.qmd (stance_source.R sources this file).
 #
 # The model is reached over a plain OpenAI-compatible endpoint, one passage per
-# request, in order. Two environment variables name it, and both are written
-# into every result so each estimate records what produced it:
-#   STANCE_URL    base URL, e.g. http://gemma-host:8000/v1
-#   STANCE_MODEL  model name as the server knows it
-#   STANCE_KEY    optional; sent as a bearer token when set (not needed at work).
-#                 It is never written into a result or shown on a page.
+# request, several requests at a time (see code_all). The URL and model are
+# written into every result so each estimate records what produced it. They
+# are set in the calling script (app.R, or the config chunk of stance.qmd):
+#   url    base URL, e.g. "http://gemma-host:8000/v1"
+#   model  model name as the server knows it
+#   key    NULL when the server needs none (work). A key is never typed into a
+#          script: when one is needed (at home), NULL reads STANCE_KEY from
+#          .Renviron. It is sent as a bearer token, never written into a result
+#          or shown on a page.
+# A url or model left NULL falls back to STANCE_URL / STANCE_MODEL.
 #
 # The data contract for the estimate functions is one row per passage:
 #   label    one of stance_labels
@@ -31,11 +35,15 @@ stance_defaults <- list(
   min_class_n = 5L,  # passages a label needs, in and out, for a curve
   df_spline = 2L)
 
-stance_endpoint <- function() {
-  ep <- list(url = Sys.getenv("STANCE_URL"), model = Sys.getenv("STANCE_MODEL"),
-             key = Sys.getenv("STANCE_KEY"))
+stance_endpoint <- function(url = getOption("stance.url"),
+                            model = getOption("stance.model"),
+                            key = getOption("stance.key")) {
+  ep <- list(url = url %||% Sys.getenv("STANCE_URL"),
+             model = model %||% Sys.getenv("STANCE_MODEL"),
+             key = key %||% Sys.getenv("STANCE_KEY"))
   if (!nzchar(ep$url) || !nzchar(ep$model))
-    stop("Set STANCE_URL and STANCE_MODEL (in .Renviron, or the app's environment variables on Posit Connect).")
+    stop("Set the model's URL and name: stance.url and stance.model in app.R ",
+         "(st$url and st$model in stance.qmd), or STANCE_URL and STANCE_MODEL.")
   ep
 }
 

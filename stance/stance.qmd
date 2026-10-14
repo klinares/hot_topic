@@ -22,6 +22,9 @@ st <- list(
   proposition = "The United States should take an active role in the affairs of other nations.",
   name = "world_role",  # short name for this claim's output files
   hand_file = "",  # a CSV of hand codes in stance/inputs, to check the labels
+  url = "http://YOUR-GEMMA-HOST:8000/v1",  # the model's base URL, ending in /v1
+  model = "YOUR-MODEL-NAME",  # as the server names it
+  key = NULL,  # none at work; never type a key here (NULL reads STANCE_KEY)
   workers = 4L,  # requests sent to the model at once; 1 sends them one by one
   save_every = 200L)  # labels are saved after this many passages
 
@@ -31,7 +34,7 @@ suppressPackageStartupMessages({
 })
 theme_set(theme_minimal(base_size = 12))
 source(here::here("stance", "stance_source.R"))  # also sources R/stance_core.R
-ep <- stance_endpoint()  # STANCE_URL and STANCE_MODEL from .Renviron
+ep <- stance_endpoint(st$url, st$model, st$key)
 d0 <- stance_defaults
 dir.create(p_out(""), showWarnings = FALSE)
 ```
@@ -40,7 +43,7 @@ dir.create(p_out(""), showWarnings = FALSE)
 
 Every passage in the corpus is read by a language model and labeled for its stance toward one claim. Nothing is sampled, so there is no sampling error and no weights. What is left is the variation of the shares themselves and the error in the labels, and only the first of those is in the intervals below.
 
-1. **Coding.** Each passage goes to the model alone, one request at a time, at temperature 0, without its date or its document. The model first decides whether the passage addresses the claim at all (otherwise *irrelevant*), then whether it favors the claim, opposes it, or is neutral.
+1. **Coding.** Each passage goes to the model alone, in its own request, at temperature 0, without its date or its document. `st$workers` requests run at once; identical passages are sent once and the label copied to each. The model first decides whether the passage addresses the claim at all (otherwise *irrelevant*), then whether it favors the claim, opposes it, or is neutral.
 2. **Estimates.** Four quantities, because a share of all passages confounds two different things:
 
 $$P(\text{favor}) = P(\text{addresses}) \times P(\text{favor} \mid \text{addresses})$$

@@ -18,7 +18,7 @@
 `%||%` <- function(x, y) if (is.null(x) || length(x) == 0) y else x
 # Each project reads its corpus from <project>/inputs and writes everything to
 # <project>/outputs. The project is an option so one copy of these functions
-# serves topics/ and unga/: each script sets it before sourcing this file.
+# serves topics/ and topics/unga/: each script sets it before sourcing this file.
 p_in <- function(...) here::here(getOption("hot_topic.project", "topics"), "inputs", ...)
 p_out <- function(...) here::here(getOption("hot_topic.project", "topics"), "outputs", ...)
 

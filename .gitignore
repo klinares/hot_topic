@@ -55,6 +55,6 @@ topics/inputs/*
 stance/inputs/*
 !topics/inputs/.gitkeep
 !stance/inputs/.gitkeep
-unga/inputs/*
-!unga/inputs/.gitkeep
-unga/outputs/stm_fit.rds
+topics/unga/inputs/*
+!topics/unga/inputs/.gitkeep
+topics/unga/outputs/stm_fit.rds

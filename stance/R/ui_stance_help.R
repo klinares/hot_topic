@@ -134,7 +134,7 @@ stance_help_ui <- function() {
     tags$p(class = "small text-muted mt-2",
       tags$strong("Model: "),
       if (is.null(ep$model)) tags$span(class = "text-danger",
-        "not configured; set STANCE_URL and STANCE_MODEL.") else
+        "not configured; set stance.url and stance.model in app.R.") else
         tagList(tags$code(ep$model), " at ", tags$code(ep$url)),
       tags$br(), tags$strong("Tried on: "), tested, " ",
       tags$a(href = docs, target = "_blank", "Method report (PDF)")))

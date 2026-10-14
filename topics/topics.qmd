@@ -154,7 +154,7 @@ topic_summary |>
 
 # Do the merge settings drive the topics?
 
-The paragraph units are rebuilt at `r str_c(tx$sens_factors, collapse = " and ")` times `min_tokens` and `max_tokens`, from the embeddings already saved (no API calls), and the model is refit at the same K. Each baseline topic is matched to its closest topic in each refit by the cosine of their word distributions. High cosines mean the topics belong to the corpus; a topic with a low cosine exists only at one way of cutting the text and deserves caution.
+The paragraph units are rebuilt at `r str_c(tx$sens_factors, collapse = " and ")` times `min_tokens` and `max_tokens`, from the embeddings already saved (no API calls), and the model is refit at the same K, with the same year spline. Each baseline topic is matched to its closest topic in each refit by the cosine of their word distributions. High cosines mean the topics belong to the corpus; a topic with a low cosine exists only at one way of cutting the text and deserves caution.
 
 ```{r sensitivity}
 #| results: asis
@@ -169,7 +169,14 @@ if (isTRUE(tx$run_sensitivity)) {
                      ms$min_sim) |>
       dplyr::filter(keep)
     s <- stm_input(clean_tokens(p), tx$min_docfreq)
+    # the same year spline as the baseline (same knots), so the refit differs
+    # from it only in how the text was cut
+    m <- tibble(para_uid = names(s$documents)) |>
+      dplyr::left_join(dplyr::select(p, para_uid, Year), by = "para_uid")
+    yb <- stats::predict(bs, newx = m$Year)
+    colnames(yb) <- colnames(bs)
     fit <- stm::stm(s$documents, s$vocab, K = K, init.type = "Spectral",
+                    prevalence = prev_form, data = as.data.frame(yb),
                     verbose = FALSE)
     match_topics(beta_matrix(stm_fit), beta_matrix(fit)) |>
       dplyr::mutate(factor = f, paragraphs = length(s$documents))
@@ -286,6 +293,8 @@ purrr::walk(pages, function(d) print(
 #| results: asis
 writeLines(glue::glue("Wrote paragraph_theta.csv, topic_summary.csv, \\
   topic_codebook.csv, topic_trends.csv, stm_fit.rds to topics/outputs/. \\
-  The app reads the four CSVs. To measure stance on one of the propositions \\
-  above, copy paragraph_theta.csv into stance/inputs/ and read stance.qmd."))
+  For the app, copy the four CSVs to topics_app/outputs/ and this report \\
+  (topics.pdf) to topics_app/www/. To measure stance on one of the \\
+  propositions above, upload the topic's paragraphs to the stance app, or \\
+  copy paragraph_theta.csv into stance/inputs/ and render stance.qmd."))
 ```

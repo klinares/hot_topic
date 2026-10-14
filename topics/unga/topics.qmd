@@ -14,7 +14,7 @@ execute:
 ```{r config}
 tx <- list(
   # the paragraphs, as already parsed from the speeches: one row per paragraph
-  input_file = "unga_paragraphs.csv",  # in unga/inputs/
+  input_file = "unga_paragraphs.csv",  # in topics/unga/inputs/
   cols = c(id = "id", year = "Year", para = "para_uid", text = "raw_text"),
   # a paragraph is analyzed only if it reads as one
   min_words = 20L,  # shorter paragraphs are headers or fragments
@@ -46,7 +46,8 @@ suppressPackageStartupMessages({
 })
 theme_set(theme_minimal(base_size = 12))
 set.seed(tx$seed)
-options(hot_topic.project = "unga")  # paths: unga/inputs, unga/outputs
+# this project's inputs/ and outputs/ live in topics/unga/
+options(hot_topic.project = file.path("topics", "unga"))
 source(here::here("topics", "topics_source.R"))  # the topics project's functions
 if (isTRUE(tx$use_openrouter)) {
   source(here::here("topics", "llm_openrouter.R"))

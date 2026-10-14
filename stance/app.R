@@ -1,17 +1,23 @@
 # app.R: the stance detector. A user uploads a CSV of short text passages,
-# writes a claim, and every passage is labeled by the model named in
-# STANCE_URL / STANCE_MODEL. Nothing is written to the server's disk and
+# writes a claim, and every passage is labeled by the model set below.
+# Nothing is written to the server's disk and
 # nothing is read from outputs/: the app works entirely on what the user
 # uploads.
 #
 # On Posit Connect:
-#   - set STANCE_URL and STANCE_MODEL as environment variables
 #   - set "Max connections per process" to 1, because a run holds the R process
 #   - publish app.R and R/ only; inputs/ and outputs/ are not needed
 
 library(shiny)
 options(bitmapType = "cairo")  # the work server has no X11
 options(shiny.maxRequestSize = 500 * 1024^2)  # uploads up to 500 MB
+
+# The model every passage is sent to. The key stays NULL: the work server needs
+# none, and a key is never typed here. Where one is needed (at home), NULL
+# reads STANCE_KEY from .Renviron instead.
+options(stance.url = "http://YOUR-GEMMA-HOST:8000/v1",  # base URL, ending in /v1
+        stance.model = "YOUR-MODEL-NAME",                # as the server names it
+        stance.key = NULL)
 
 # Requests sent to the model at the same time. These are open connections to
 # the model server, not R cores: R waits while the server works. Set it to
