@@ -2,15 +2,15 @@
 
 ![](images/hot_topic_logo.svg)
 
-Two tools over the same kind of text, each with its own scripts, its own Shiny app, and its own deployment, and a third project that applies both to UN General Assembly speeches.
+Two tools over the same kind of text, each with its own scripts, its own Shiny app, and its own deployment, and a third project that applies the topic method to UN General Assembly speeches.
 
 ```         
 topics/   what a corpus is written about, and how that changes over time   (app)
 stance/   where writers stand on one claim, in any corpus a user uploads  (app)
-unga/     both methods on UNGA speeches: topics, then stance in one slice (scripts)
+unga/     topics in UNGA General Debate speeches, 2000 to 2026        (script)
 ```
 
-`topics/` fits a model once and serves the result; `stance/` calls a language model on every run and holds its R process while it does. Keeping them apart means a stance run cannot freeze the topics dashboard, and either app can be deployed, restarted, or taken down without the other. `unga/` has no functions of its own: it sources `topics/topics_source.R` and `stance/R/stance_core.R`, so its numbers mean what they mean in the apps.
+`topics/` fits a model once and serves the result; `stance/` calls a language model on every run and holds its R process while it does. Keeping them apart means a stance run cannot freeze the topics dashboard, and either app can be deployed, restarted, or taken down without the other. `unga/` has no functions of its own: it sources `topics/topics_source.R`, so its topics mean what they mean in the topics project.
 
 Each folder has the same shape:
 
@@ -111,7 +111,7 @@ Only passages between 5 and 250 words are coded. Rows outside the bounds are rep
 
 A time column may be a numeric year, `YYYY-MM`, or a date. Months become `year + (month - 1) / 12`, so one unit of time is one year either way.
 
-`stance.qmd` saves labels every `save_every` passages and resumes where it stopped; `st$workers` sets its parallel requests, as `st$workers` does in `unga/stance.R`. The app keeps nothing: it shows the estimates and offers them as a CSV that records the claim, the full prompt, the model, the endpoint, the counts, and the date.
+`stance.qmd` saves labels every `save_every` passages and resumes where it stopped; `st$workers` sets its parallel requests. The app keeps nothing: it shows the estimates and offers them as a CSV that records the claim, the full prompt, the model, the endpoint, the counts, and the date.
 
 ### stance/outputs/ (written by stance.qmd only)
 
@@ -130,11 +130,10 @@ The intervals treat the labels as correct. Nothing in the pipeline measures how 
 ## unga/
 
 ```         
-unga/topics.qmd   UNGA paragraphs -> STM topics, codebook, prevalence trends
-unga/stance.R     one claim, one topic, then one country (trend) or one year (static)
+unga/topics.qmd   UNGA paragraphs -> STM topics, codebook, prevalence trends, findings
 ```
 
-The paragraphs are already clean units, so there is no preprocessing step. `stance.R` codes every paragraph of the chosen topic inside the filter, with the stance app's own functions. Because a country gives one speech a year, its trend rule counts speeches rather than passages: a year counts with one paragraph, and a trend needs 10 speeches. The plots mark the stance model's training cutoff, since 2026 speeches are the ones it cannot have seen. Details in [unga/README.md](unga/README.md).
+The paragraphs come already parsed from the speeches and are shared with other analyses, so they are never merged, split, or edited: a paragraph that is not one (headers, the presiding officer, fragments under 20 words) is left out whole, and every output joins back on `id` + `para_uid`. Stance is done in the stance app: filter `paragraph_topics.parquet`, join the text back, and upload. `stm_fit.rds` is too large for GitHub at this size and is ignored. Details in [unga/README.md](unga/README.md).
 
 ## Running at home
 
@@ -218,6 +217,5 @@ Apps: shiny, bslib, ggplot2, dplyr, purrr, readr, tibble, withr, splines, httr2 
 | `httr2 1.1.1 or later is needed to send requests in parallel` | update httr2 on the machine or server running it |
 | check: `The two files come from different runs` | the labeled file and the sheet must come from the same run; download them together |
 | check: `No row of the sheet has a hand_label yet` | the sheet was uploaded before it was coded, or the column was renamed |
-| unga: `No paragraph of topic K with country = X` | check the spelling of the country as it is in the data, or pick another topic |
 | request fails with HTTP 401 at home | `STANCE_KEY` is empty; see Running at home |
 | app: `could not find function "load_outputs"` | the helper files are not in `R/`, or the app was started from the wrong folder |
