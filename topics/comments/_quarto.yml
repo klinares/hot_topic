@@ -1,0 +1,4 @@
+# Every script in this folder renders its PDF into reports/, where the app
+# links to it. Nothing is copied by hand.
+project:
+  output-dir: reports

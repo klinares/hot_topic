@@ -15,8 +15,8 @@ options(shiny.maxRequestSize = 500 * 1024^2)  # uploads up to 500 MB
 # The model every passage is sent to. The key stays NULL: the work server needs
 # none, and a key is never typed here. Where one is needed (at home), NULL
 # reads STANCE_KEY from .Renviron instead.
-options(stance.url = "http://YOUR-GEMMA-HOST:8000/v1",  # base URL, ending in /v1
-        stance.model = "YOUR-MODEL-NAME",                # as the server names it
+options(stance.url = "http://localhost:11434/v1",
+        stance.model = "gemma4:12b-it-qat",   # exactly as `ollama list` prints it
         stance.key = NULL)
 
 # Requests sent to the model at the same time. These are open connections to

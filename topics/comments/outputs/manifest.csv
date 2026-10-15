@@ -1,0 +1,8 @@
+output,input,md5
+searchK.parquet,paragraphs.csv,92dcdf90e839cde91117d8c83391cbda
+stm_fit.rds,paragraphs.csv,92dcdf90e839cde91117d8c83391cbda
+sensitivity.parquet,paragraphs.csv,92dcdf90e839cde91117d8c83391cbda
+sensitivity.parquet,blocks.parquet,5637bace0fbe4f1d564c8509537cf050
+sensitivity.parquet,embeddings.parquet,67a58d5badc498bf8c914a7881f8291d
+sensitivity.parquet,merge_settings.parquet,6ec2560dd46fdd673e3054748ebad367
+topic_codebook.csv,paragraph_theta.csv,9d1c29d75c77a0bc21c647992c786476

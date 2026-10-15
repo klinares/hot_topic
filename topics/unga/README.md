@@ -18,12 +18,12 @@ One row per paragraph, as already parsed from the speeches (paragraphs are the b
 |------------------------------------|------------------------------------|
 | `id` | the speech |
 | `Year` | the year of the session, a whole number |
-| `para_uid` | the paragraph's position within the speech: 1, 2, 3, ... |
+| `para_id` | the paragraph's position within the speech: 1, 2, 3, ... |
 | `raw_text` | the paragraph |
 
-Names are set in `tx$cols` if yours differ. `id` + `para_uid` must be unique, and a speech must have one year; the script stops and says so if not.
+`id` + `para_id` must be unique, and a speech must have one year; the script stops and says so if not.
 
-**The paragraphs are used exactly as parsed.** None is merged, split, or edited, so every result joins back to other analyses of the same paragraphs on `id` + `para_uid`. A paragraph that is not one is left out whole:
+**The paragraphs are used exactly as parsed.** None is merged, split, or edited, so every result joins back to other analyses of the same paragraphs on `id` + `para_id`. A paragraph that is not one is left out whole:
 
 1. **no complete sentence**: nothing ending in `.`, `?`, or `!`. This catches headers such as `Meeting/Event: peru` and `[Auto-generated transcript: may contain errors]`, dates, and subheadings;
 2. **the presiding officer speaking**: introducing the speaker or thanking them, matched by the phrases in `tx$procedural` ("will now hear an address", "on behalf of the Assembly, I wish to thank", ...). Add phrases there if the report's examples show more;
@@ -41,17 +41,17 @@ The report counts each, plots the share left out by year, and prints examples of
 
 At work, set `use_openrouter = FALSE`; the codebook then uses `COMPASS_LARGE_URL` / `COMPASS_LARGE_KEY` from `.Renviron`.
 
-The script lives inside the topics project and uses its functions (`topics/topics_source.R`), so the method is the same as `topics/topics.qmd`, minus the paragraph-building step that these transcripts do not need. A change to `topics_source.R` changes this analysis too: rerender after editing it.
+The script lives inside the topics project and uses its functions (`topics/topics_source.R`), so the method is the same as `topics/comments/topics.qmd`, minus the paragraph-building step that these transcripts do not need. A change to `topics_source.R` changes this analysis too: rerender after editing it.
 
 ## Outputs
 
 | File | What | Size at 180,000 paragraphs |
 |------------------------------------|------------------------------------|------------------------------------|
-| `paragraph_topics.parquet` | `id`, `para_uid`, `Year`, assigned topic, its share, and every topic's share (4 decimals). No text | about 10 MB at K = 40 (0.7 MB measured at K = 4) |
+| `paragraph_topics.parquet` | `id`, `para_id`, `Year`, assigned topic, its share, and every topic's share (4 decimals). No text | about 10 MB at K = 40 (0.7 MB measured at K = 4) |
 | `topic_summary.parquet` | per-topic prevalence, FREX and probable words, paragraphs, AvePP | small |
 | `topic_trends.parquet` | estimated share of each topic by year, with 95% intervals | small |
 | `topic_codebook.csv` | labels, descriptions, propositions (edit by hand) | small |
-| `dropped_paragraphs.parquet` | `id`, `para_uid`, `Year`, and the reason each was left out | small |
+| `dropped_paragraphs.parquet` | `id`, `para_id`, `Year`, and the reason each was left out | small |
 | `searchK_*.parquet` | the scores behind each K search | small |
 | `stm_fit.rds` | the fitted model. **Not tracked by git** | about 70 MB measured at K = 4; 200 MB or more at K = 40 |
 | `manifest.csv` | which input each saved result was built from | small |

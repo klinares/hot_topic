@@ -49,12 +49,10 @@ po/*~
 rsconnect/
 
 # Raw data: each project reads its corpus from its own inputs/ folder, which
-# stays off GitHub. Everything the scripts write (CSV, parquet, the STM fit)
-# is small enough to track, except the UNGA fit, which passes GitHub's 100 MB limit.
-topics/inputs/*
+# stays off GitHub. Everything the scripts write is small enough to track,
+# except the UNGA fit, which passes GitHub's 100 MB limit.
+topics/*/inputs/*
+!topics/*/inputs/.gitkeep
 stance/inputs/*
-!topics/inputs/.gitkeep
 !stance/inputs/.gitkeep
-topics/unga/inputs/*
-!topics/unga/inputs/.gitkeep
 topics/unga/outputs/stm_fit.rds

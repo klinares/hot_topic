@@ -6,7 +6,7 @@
 #   options(hot_topic.source = "...")      what the text is, in a phrase
 #   options(hot_topic.unit = c("comment", "comments"))  one document, and many
 #   options(hot_topic.stance_app = "...")  link to the stance app, if deployed
-# The method reports are PDFs in www/; each one there gets a link.
+# The method reports are the PDFs that Quarto renders into reports/.
 
 # bold text followed by punctuation, without the space HTML would put between
 b_ <- function(x) tags$strong(x, .noWS = "after")
@@ -18,8 +18,8 @@ help_ui <- function(hd) {
   stance_app <- getOption("hot_topic.stance_app", "")
   fmt <- function(x) format(x, big.mark = ",")
   p <- hd$paras
-  n_docs <- dplyr::n_distinct(p$atom_id)
-  per_doc <- dplyr::count(p, atom_id)$n
+  n_docs <- dplyr::n_distinct(p$id)
+  per_doc <- dplyr::count(p, id)$n
   top <- dplyr::slice_max(hd$topics, prevalence, n = 3)
 
   tagList(
@@ -135,7 +135,7 @@ help_ui <- function(hd) {
 help_server <- function(input, output, hd) {
   output$help_years <- renderPlot({
     hd$paras |>
-      dplyr::distinct(atom_id, Year) |>
+      dplyr::distinct(id, Year) |>
       dplyr::count(Year) |>
       ggplot2::ggplot(ggplot2::aes(Year, n)) +
       ggplot2::geom_col(fill = viridisLite::viridis(1, begin = 0.35)) +
@@ -144,16 +144,16 @@ help_server <- function(input, output, hd) {
   })
 }
 
-# One link per method report found in www/, which Shiny serves from the app's
-# root, so the links work wherever the app is deployed.
+# One link per method report found in reports/, which app.R serves under the
+# same path, so the links work wherever the app is deployed.
 help_reports <- function() {
   reports <- c("topics.pdf" = "How topics and their trends were estimated",
                "preprocess.pdf" = "How the text was divided into paragraphs")
-  have <- reports[file.exists(file.path("www", names(reports)))]
+  have <- reports[file.exists(file.path("reports", names(reports)))]
   if (!length(have))
-    return(tags$p(class = "small text-danger", "No method report found in www/."))
+    return(tags$p(class = "small text-danger", "No method report found in reports/. Render preprocess.qmd and topics.qmd."))
   tags$ul(purrr::imap(have, function(txt, f)
-    tags$li(tags$a(href = f, target = "_blank", txt, " (PDF)"))))
+    tags$li(tags$a(href = file.path("reports", f), target = "_blank", txt, " (PDF)"))))
 }
 
 # ---- the flowchart -----------------------------------------------------------

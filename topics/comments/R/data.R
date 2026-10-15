@@ -15,11 +15,11 @@ load_outputs <- function(dir) {
   miss <- need[!file.exists(file.path(dir, need))]
   if (length(miss))
     stop("Not found in ", normalizePath(dir, mustWork = FALSE), ": ",
-         paste(miss, collapse = ", "), ". Render topics.qmd first, or point HOT_TOPIC_DATA at them.")
+         paste(miss, collapse = ", "), ". Render preprocess.qmd and topics.qmd first.")
   rd <- function(f) readr::read_csv(file.path(dir, f), show_col_types = FALSE,
                                     progress = FALSE)
   paras <- rd(need[1]); cb <- rd(need[2]); sm <- rd(need[3]); tr <- rd(need[4])
-  check_cols(paras, c("para_uid", "atom_id", "para_id", "Year", "text",
+  check_cols(paras, c("para_uid", "id", "para_id", "Year", "text",
                       "topic", "theta_max"), need[1])
   check_cols(cb, c("topic", "label", "description"), need[2])
   check_cols(sm, c("topic", "prevalence", "frex", "avepp"), need[3])
@@ -38,7 +38,7 @@ load_outputs <- function(dir) {
     dplyr::arrange(dplyr::desc(prevalence))
   paras <- paras |>
     dplyr::left_join(dplyr::select(topics, topic, label), by = "topic") |>
-    dplyr::arrange(atom_id, para_id)
+    dplyr::arrange(id, para_id)
   list(paras = paras, topics = topics, trends = tr, years = range(paras$Year))
 }
 

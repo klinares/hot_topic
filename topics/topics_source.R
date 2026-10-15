@@ -1,26 +1,22 @@
-# topics_source.R: shared functions for preprocess.qmd and topics.qmd, and
-# for the UNGA scripts, which reuse them on a corpus that needs no
-# preprocessing. Only function definitions live here; nothing runs when it is
-# sourced.
-#   1. Setup and model calls
+# topics_source.R: the functions behind every topics project. Each project
+# folder (comments/, unga/) sources this file with source("../topics_source.R").
+# Quarto runs each script from its own folder, so the relative paths below
+# point at that project's inputs/ and outputs/. Only function definitions live here; nothing runs when it is sourced.
+#   1. Paths and model calls
 #   2. Output guard (manifest.csv)
-#   3. Paragraph units
-#   4. Topic model helpers
-#   5. Topic trends
-#   6. Tables for Typst
-#
-# Stance lives in its own project (../stance) with its own functions; the two
-# share nothing but the cluster-robust variance below, which is eight lines and
-# not worth a dependency between two apps that deploy separately.
+#   3. Paragraph units (comments only: split, embed, merge)
+#   4. Topic model
+#   5. Topic codebook
+#   6. Trends over time
+#   7. Tables and plots
 
-# ---- 1. Setup and model calls ------------------------------------------------
+# ---- 1. Paths and model calls ------------------------------------------------
 
 `%||%` <- function(x, y) if (is.null(x) || length(x) == 0) y else x
-# Each project reads its corpus from <project>/inputs and writes everything to
-# <project>/outputs. The project is an option so one copy of these functions
-# serves topics/ and topics/unga/: each script sets it before sourcing this file.
-p_in <- function(...) here::here(getOption("hot_topic.project", "topics"), "inputs", ...)
-p_out <- function(...) here::here(getOption("hot_topic.project", "topics"), "outputs", ...)
+
+# Each project reads <project>/inputs and writes <project>/outputs.
+p_in <- function(...) file.path("inputs", ...)
+p_out <- function(...) file.path("outputs", ...)
 
 # Every prompt has the same four parts, so each one reads the same way.
 build_prompt <- function(role, task, rules, output) {
@@ -28,30 +24,29 @@ build_prompt <- function(role, task, rules, output) {
         str_c("- ", rules, collapse = "\n"), "\n\nOUTPUT\n", output)
 }
 
-# One chat object per pipeline step. The steps table holds the NAMES of the
-# .Renviron variables for the URL and key, never the values.
-make_chat <- function(step, system_prompt, steps, home = FALSE) {
+# The URL, key and model for one pipeline step. The steps table holds the
+# NAMES of the .Renviron variables, never the values. At home (OpenRouter)
+# the model comes from llm_openrouter.R.
+step_config <- function(step, steps, home = FALSE) {
   cfg <- steps[steps$step == step, ]
   if (nrow(cfg) != 1) stop("No unique '", step, "' row in the steps table.")
-  if (isTRUE(home)) return(make_chat_home(cfg$model, system_prompt))
-  if (utils::packageVersion("ellmer") < "0.4.0")
-    stop("ellmer 0.4.0 or later is needed (credentials argument).")
+  if (isTRUE(home))
+    return(list(url = "https://openrouter.ai/api/v1",
+                key = Sys.getenv("OPENROUTER_API_KEY"),
+                model = unname(open_router_models[[step]])))
   url <- Sys.getenv(cfg$base_url_env)
   key <- Sys.getenv(cfg$api_key_env)
   if (!nzchar(url) || !nzchar(key))
     stop("Set ", cfg$base_url_env, " and ", cfg$api_key_env, " in .Renviron.")
-  ellmer::chat_openai_compatible(
-    base_url = url, model = cfg$model, system_prompt = system_prompt,
-    credentials = function() key,
-    params = ellmer::params(temperature = 0), echo = "none")
+  list(url = url, key = key, model = cfg$model)
 }
 
-# Many prompts through one chat, in parallel, under the provider's per-minute
-# limit. Returns a data frame with one row per prompt; a failed call is NA.
-ask_many <- function(chat, prompts, type, rpm = 300L, max_active = 10L) {
-  ellmer::parallel_chat_structured(chat, as.list(prompts), type = type,
-                                   rpm = rpm, max_active = max_active,
-                                   on_error = "continue")
+make_chat <- function(step, system_prompt, steps, home = FALSE) {
+  cfg <- step_config(step, steps, home)
+  ellmer::chat_openai_compatible(
+    base_url = cfg$url, model = cfg$model, system_prompt = system_prompt,
+    credentials = function() cfg$key,
+    params = ellmer::params(temperature = 0), echo = "none")
 }
 
 # ---- 2. Output guard (manifest.csv) ------------------------------------------
@@ -61,9 +56,8 @@ ask_many <- function(chat, prompts, type, rpm = 300L, max_active = 10L) {
 
 manifest_read <- function() {
   f <- p_out("manifest.csv")
-  if (!file.exists(f)) return(tibble::tibble(output = character(),
-                                             input = character(),
-                                             md5 = character()))
+  if (!file.exists(f))
+    return(tibble::tibble(output = character(), input = character(), md5 = character()))
   readr::read_csv(f, show_col_types = FALSE, col_types = "ccc")
 }
 
@@ -77,24 +71,22 @@ md5_of <- function(inputs) {
 
 check_inputs <- function(output, inputs) {
   if (!file.exists(output)) return(invisible(TRUE))
-  old <- dplyr::filter(manifest_read(), output == basename(!!output))
-  if (nrow(old) == 0) return(invisible(TRUE))
-  now <- tibble::tibble(input = basename(inputs), md5_now = md5_of(inputs))
-  changed <- dplyr::inner_join(old, now, by = "input") |>
+  changed <- manifest_read() |>
+    dplyr::filter(output == basename(!!output)) |>
+    dplyr::inner_join(tibble::tibble(input = basename(inputs), md5_now = md5_of(inputs)),
+                      by = "input") |>
     dplyr::filter(md5 != md5_now)
   if (nrow(changed))
     stop(str_c(changed$input, collapse = ", "), " changed since ",
-         basename(output), " was built. Delete ", basename(output),
-         " and re-render.")
+         basename(output), " was built. Delete ", basename(output), " and re-render.")
   invisible(TRUE)
 }
 
 record_inputs <- function(output, inputs) {
-  new <- tibble::tibble(output = basename(output), input = basename(inputs),
-                        md5 = md5_of(inputs))
   manifest_read() |>
     dplyr::filter(output != basename(!!output)) |>
-    dplyr::bind_rows(new) |>
+    dplyr::bind_rows(tibble::tibble(output = basename(output),
+                                    input = basename(inputs), md5 = md5_of(inputs))) |>
     readr::write_csv(p_out("manifest.csv"))
 }
 
@@ -115,40 +107,60 @@ cached <- function(path, inputs, expr) {
 
 # Split each comment at line breaks, then rejoin hard-wrapped fragments: a line
 # that follows a line without end punctuation and starts lowercase is the same
-# sentence. A wrap before a capital ("I", a name) is left for the merge step.
+# sentence. Output is sorted by id, then block_id.
 split_blocks <- function(corpus) {
-  raw <- corpus |>
-    dplyr::mutate(block = str_split(body_english, "\\r?\\n+")) |>
-    dplyr::select(atom_id, Year, block) |>
+  corpus |>
+    dplyr::mutate(block = str_split(raw_text, "\\r?\\n+")) |>
+    dplyr::select(id, Year, block) |>
     tidyr::unnest(block) |>
     dplyr::mutate(block = str_squish(block)) |>
-    dplyr::filter(block != "")
-  out <- raw |>
-    dplyr::group_by(atom_id) |>
+    dplyr::filter(block != "") |>
+    dplyr::group_by(id) |>
     dplyr::mutate(fragment = str_detect(block, "^[a-z]") &
-                    !str_detect(dplyr::lag(block, default = "."),
-                                "[.!?:;][\"')\\]]*$"),
+                    !str_detect(dplyr::lag(block, default = "."), "[.!?:;][\"')\\]]*$"),
                   block_id = cumsum(!fragment)) |>
-    dplyr::group_by(atom_id, Year, block_id) |>
+    dplyr::group_by(id, Year, block_id) |>
     dplyr::summarise(block = str_c(block, collapse = " "), .groups = "drop") |>
-    dplyr::mutate(n_tokens = str_count(block, "\\S+"))
-  attr(out, "lines_in") <- nrow(raw)
-  out
+    dplyr::mutate(n_tokens = str_count(block, "\\S+")) |>
+    dplyr::arrange(id, block_id)
 }
 
-# Embeddings go through httr2 because ellmer has no embedding function. One
-# request per comment; window_n requests in parallel, then window_wait seconds
-# of rest, so no minute sees more than window_n calls. Saved after each
-# window, so a stopped run resumes where it left off.
-embed_endpoint <- function(steps, home = FALSE) {
-  cfg <- steps[steps$step == "embed", ]
-  if (nrow(cfg) != 1) stop("No unique 'embed' row in the steps table.")
-  if (isTRUE(home)) return(embed_endpoint_home(cfg$model))
-  url <- Sys.getenv(cfg$base_url_env)
-  key <- Sys.getenv(cfg$api_key_env)
-  if (!nzchar(url) || !nzchar(key))
-    stop("Set ", cfg$base_url_env, " and ", cfg$api_key_env, " in .Renviron.")
-  list(url = url, key = key, model = unname(cfg$model))
+# Embeddings are stored one row per distinct block text, keyed by its md5
+# (hash, model, e1..eN). Requests pack up to batch_size texts each, whatever
+# comment they come from, so no request exceeds the endpoint's input limit
+# (37 at work). window_n requests go out together, then window_wait seconds of
+# rest. The file is saved after every window, so a stopped run resumes where
+# it left off, and a text is never sent twice.
+embed_all <- function(blocks, path, steps, home, batch_size, window_n, window_wait) {
+  ep <- step_config("embed", steps, home)
+  done <- if (file.exists(path)) tibble::as_tibble(arrow::read_parquet(path)) else NULL
+  if (!is.null(done) && !identical(done$model[1], ep$model))
+    stop(basename(path), " was built with '", done$model[1], "'. Delete it to re-embed.")
+  todo <- dplyr::distinct(tibble::tibble(hash = cli::hash_md5(blocks$block),
+                                         text = blocks$block), hash, .keep_all = TRUE) |>
+    dplyr::filter(!hash %in% done$hash)
+  batches <- split(todo, ceiling(seq_len(nrow(todo)) / batch_size))
+  windows <- split(batches, ceiling(seq_along(batches) / window_n))
+  done <- purrr::reduce(seq_along(windows), function(done, w) {
+    win <- windows[[w]]
+    message(glue::glue("window {w} of {length(windows)}: {length(win)} requests"))
+    resps <- purrr::map(win, function(b) embed_request(b$text, ep)) |>
+      httr2::req_perform_parallel(on_error = "continue", max_active = 10L, progress = TRUE)
+    ok <- purrr::map_lgl(resps, inherits, "httr2_response")
+    if (!all(ok)) message("failed requests: ", sum(!ok), ". First error: ",
+                          conditionMessage(resps[!ok][[1]]))
+    new <- purrr::map2(win[ok], resps[ok], function(b, r)
+      dplyr::bind_cols(tibble::tibble(hash = b$hash, model = ep$model), embed_parse(r))) |>
+      purrr::list_rbind()
+    done <- dplyr::bind_rows(done, new)
+    if (!is.null(done) && nrow(done)) arrow::write_parquet(done, path)
+    if (w < length(windows)) Sys.sleep(window_wait)
+    done
+  }, .init = done)
+  missing <- sum(!unique(cli::hash_md5(blocks$block)) %in% done$hash)
+  if (missing) stop(missing, " blocks are not embedded. Re-run the chunk; ",
+                    "embedded blocks are not re-sent.")
+  done
 }
 
 embed_request <- function(txt, ep) {
@@ -156,110 +168,44 @@ embed_request <- function(txt, ep) {
     httr2::req_url_path_append("embeddings") |>
     httr2::req_auth_bearer_token(ep$key) |>
     httr2::req_body_json(list(model = ep$model, input = as.list(txt))) |>
-    httr2::req_retry(max_tries = 3) |>
-    httr2::req_error(body = function(resp)
-      if (httr2::resp_has_body(resp)) httr2::resp_body_string(resp))
+    httr2::req_retry(max_tries = 3)
 }
 
+# The response lists one vector per input, tagged with its position.
 embed_parse <- function(resp) {
   d <- httr2::resp_body_json(resp)$data
-  d <- d[order(purrr::map_int(d, "index"))]
-  do.call(rbind, purrr::map(d, function(x) unlist(x$embedding)))
+  m <- do.call(rbind, purrr::map(d, function(x) unlist(x$embedding)))
+  m <- m[order(purrr::map_int(d, "index")), , drop = FALSE]
+  colnames(m) <- str_c("e", seq_len(ncol(m)))
+  tibble::as_tibble(m)
 }
 
-# Embeddings on disk: one row per block (atom_id, block, model, e1..eN). In
-# memory: model, and a list of one matrix per comment, rows in block order.
-emb_write <- function(cache, path) {
-  if (!length(cache$vec)) return(invisible())
-  purrr::imap(cache$vec, function(m, id) {
-    colnames(m) <- str_c("e", seq_len(ncol(m)))
-    dplyr::bind_cols(tibble::tibble(atom_id = id, block = seq_len(nrow(m))),
-                     tibble::as_tibble(m))
-  }) |>
-    purrr::list_rbind() |>
-    dplyr::mutate(model = cache$model, .before = 1) |>
-    arrow::write_parquet(path)
+# One embedding row per block, in the same order as blocks.
+emb_matrix <- function(blocks, emb) {
+  m <- as.matrix(emb[str_detect(names(emb), "^e[0-9]+$")])
+  m[match(cli::hash_md5(blocks$block), emb$hash), , drop = FALSE]
 }
 
-emb_read <- function(path) {
-  d <- dplyr::arrange(tibble::as_tibble(arrow::read_parquet(path)), atom_id, block)
-  m <- unname(as.matrix(d[str_detect(names(d), "^e[0-9]+$")]))
-  list(model = d$model[1], errors = character(),
-       vec = purrr::map(split(seq_len(nrow(d)), d$atom_id),
-                        function(i) m[i, , drop = FALSE]))
+cosine_rows <- function(A, B) rowSums(A * B) / sqrt(rowSums(A^2) * rowSums(B^2))
+
+# Similarity of every adjacent pair of blocks within a comment. The merge
+# threshold is a quantile of these, so it means the same thing whichever
+# embedding model produced the vectors.
+adjacent_sims <- function(blocks, E) {
+  n <- nrow(blocks)
+  same <- blocks$id[-1] == blocks$id[-n]
+  cosine_rows(E[-n, , drop = FALSE], E[-1, , drop = FALSE])[same]
 }
 
-embed_all <- function(blocks, path, steps, home, window_n, window_wait) {
-  ep <- embed_endpoint(steps, home)
-  model <- unname(steps$model[steps$step == "embed"])
-  cache <- if (file.exists(path)) emb_read(path) else
-    list(model = model, vec = list(), errors = character())
-  if (!identical(cache$model, model))
-    stop("embeddings.parquet was built with '", cache$model, "'. Delete it to ",
-         "re-embed with the configured model.")
-  # a cached matrix is reused only if it still has one row per block
-  n_blk <- table(blocks$atom_id)
-  stale <- purrr::keep(names(cache$vec), function(id)
-    id %in% names(n_blk) && nrow(cache$vec[[id]]) != n_blk[[id]])
-  cache$vec[stale] <- NULL
-  todo <- setdiff(unique(blocks$atom_id), names(cache$vec))
-  windows <- split(todo, ceiling(seq_along(todo) / window_n))
-  cache <- purrr::reduce(seq_along(windows), function(cache, w) {
-    ids <- windows[[w]]
-    message(glue::glue("window {w} of {length(windows)}: {length(ids)} requests"))
-    resps <- purrr::map(ids, function(id)
-      embed_request(blocks$block[blocks$atom_id == id], ep)) |>
-      httr2::req_perform_parallel(on_error = "continue", max_active = window_n,
-                                  progress = TRUE)
-    res <- purrr::map(resps, function(r)
-      if (inherits(r, "httr2_response"))
-        tryCatch(embed_parse(r), error = conditionMessage)
-      else conditionMessage(r)) |>
-      purrr::set_names(ids)
-    ok <- purrr::map_lgl(res, is.matrix)
-    cache$vec <- c(cache$vec, res[ok])
-    cache$errors <- c(cache$errors[setdiff(names(cache$errors), ids)],
-                      unlist(res[!ok]))
-    emb_write(cache, path)
-    if (w < length(windows))
-      purrr::walk(seq_len(window_wait), function(s) Sys.sleep(1),
-                  .progress = glue::glue("resting {window_wait}s"))
-    cache
-  }, .init = cache)
-  missing <- setdiff(unique(blocks$atom_id), names(cache$vec))
-  if (length(missing))
-    stop(length(missing), " comments could not be embedded. First error: ",
-         cache$errors[[missing[1]]] %||% "unknown",
-         ". Re-run the chunk; embedded comments are not re-sent.")
-  cache
-}
-
-cosine <- function(a, b) sum(a * b) / sqrt(sum(a^2) * sum(b^2))
-
-# Similarity of every adjacent pair of blocks in the corpus. Used to set the
-# merge threshold as a quantile, so it means the same thing whichever
-# embedding model produced the vectors (E5 cosines run much higher than
-# others, so a fixed number would not travel between models).
-adjacent_sims <- function(blocks, vec) {
-  blocks |>
-    dplyr::group_split(atom_id) |>
-    purrr::map(function(b) {
-      E <- vec[[b$atom_id[1]]]
-      if (nrow(E) < 2) return(numeric())
-      purrr::map_dbl(seq_len(nrow(E) - 1), function(i) cosine(E[i, ], E[i + 1, ]))
-    }) |>
-    unlist()
-}
-
-# One merge: of the adjacent pairs that are allowed to merge, join the most
-# similar. A pair is allowed when at least one side is short, the result
-# stays within max_tokens, and the two are similar enough. The merged vector
-# is the token-weighted mean of the two, which avoids re-embedding.
+# One merge: of the adjacent pairs allowed to merge, join the most similar. A
+# pair is allowed when one side is short, the result stays within max_tokens,
+# and the two are similar enough. The merged vector is the token-weighted mean
+# of the two, which avoids re-embedding.
 merge_once <- function(u, min_tokens, max_tokens, min_sim) {
   k <- length(u$n)
   if (k < 2) return(u)
   i <- seq_len(k - 1)
-  sim <- purrr::map_dbl(i, function(j) cosine(u$E[j, ], u$E[j + 1, ]))
+  sim <- cosine_rows(u$E[i, , drop = FALSE], u$E[i + 1, , drop = FALSE])
   ok <- (u$n[i] < min_tokens | u$n[i + 1] < min_tokens) &
     u$n[i] + u$n[i + 1] <= max_tokens & sim >= min_sim
   if (!any(ok)) return(u)
@@ -269,47 +215,39 @@ merge_once <- function(u, min_tokens, max_tokens, min_sim) {
   u$text[j] <- str_c(u$text[j], " ", u$text[j + 1])
   u$n[j] <- u$n[j] + u$n[j + 1]
   u$n_blocks[j] <- u$n_blocks[j] + u$n_blocks[j + 1]
-  u$text <- u$text[-(j + 1)]; u$n <- u$n[-(j + 1)]
-  u$n_blocks <- u$n_blocks[-(j + 1)]
+  u$text <- u$text[-(j + 1)]; u$n <- u$n[-(j + 1)]; u$n_blocks <- u$n_blocks[-(j + 1)]
   u$E <- u$E[-(j + 1), , drop = FALSE]
   u
 }
 
-# Merge one comment's blocks until no allowed pair remains. Each step removes
-# one block, so at most (blocks - 1) steps; extra steps change nothing. Units
-# still under min_tokens are kept in the output but flagged keep = FALSE.
-# Each unit carries its vector (vec), kept for the sensitivity refit.
+# Merge one comment's blocks until no allowed pair remains (at most blocks - 1
+# merges). Units still under min_tokens are flagged keep = FALSE.
 link_comment <- function(b, E, min_tokens, max_tokens, min_sim) {
   u <- list(text = b$block, n = b$n_tokens, n_blocks = rep(1L, nrow(b)), E = E)
   u <- purrr::reduce(seq_len(max(0, nrow(b) - 1)), function(u, s)
     merge_once(u, min_tokens, max_tokens, min_sim), .init = u)
-  tibble::tibble(atom_id = b$atom_id[1], Year = b$Year[1], text = u$text,
-                 n_tokens = u$n, n_blocks = u$n_blocks,
-                 keep = u$n >= min_tokens,
-                 vec = purrr::map(seq_len(nrow(u$E)), function(i) u$E[i, ]))
+  tibble::tibble(id = b$id[1], Year = b$Year[1], text = u$text, n_tokens = u$n,
+                 n_blocks = u$n_blocks, keep = u$n >= min_tokens)
 }
 
-link_corpus <- function(blocks, vec, min_tokens, max_tokens, min_sim) {
-  blocks |>
-    dplyr::group_split(atom_id) |>
-    purrr::map(function(b)
-      link_comment(b, vec[[b$atom_id[1]]], min_tokens, max_tokens, min_sim)) |>
+link_corpus <- function(blocks, E, min_tokens, max_tokens, min_sim) {
+  split(seq_len(nrow(blocks)), blocks$id) |>
+    purrr::map(function(i)
+      link_comment(blocks[i, ], E[i, , drop = FALSE], min_tokens, max_tokens, min_sim)) |>
     purrr::list_rbind() |>
-    dplyr::group_by(atom_id) |>
+    dplyr::group_by(id) |>
     dplyr::mutate(para_id = dplyr::row_number(),
-                  para_uid = str_c(atom_id, "-", sprintf("%02d", para_id))) |>
+                  para_uid = str_c(id, "-", sprintf("%02d", para_id))) |>
     dplyr::ungroup()
 }
 
-# ---- 4. Topic model helpers --------------------------------------------------
+# ---- 4. Topic model ----------------------------------------------------------
 
-# Tokens for the topic model: lowercase, letters only, no stopwords, no month
-# or weekday names (they would let topics encode the year directly), and no
-# words in `drop` (boilerplate every document shares).
+# Tokens: lowercase, letters only, no stopwords, no month or weekday names
+# (they would let topics encode the year), no words in `drop`.
 clean_tokens <- function(paras, drop = character()) {
-  temporal <- str_to_lower(c(month.name, month.abb, "monday", "tuesday",
-                             "wednesday", "thursday", "friday", "saturday",
-                             "sunday"))
+  temporal <- str_to_lower(c(month.name, month.abb, "monday", "tuesday", "wednesday",
+                             "thursday", "friday", "saturday", "sunday"))
   paras |>
     dplyr::select(para_uid, text) |>
     tidytext::unnest_tokens(word, text) |>
@@ -319,9 +257,8 @@ clean_tokens <- function(paras, drop = character()) {
                   !word %in% temporal, !word %in% drop)
 }
 
-# Tokens to stm's input format: a vocabulary, and per paragraph a 2-row
-# integer matrix of (word index, count). Words in fewer than min_docfreq
-# paragraphs are dropped.
+# Tokens to stm's input: a vocabulary, and per paragraph a 2-row matrix of
+# (word index, count). Words in fewer than min_docfreq paragraphs are dropped.
 stm_input <- function(tokens, min_docfreq) {
   counts <- tokens |>
     dplyr::count(para_uid, word) |>
@@ -334,29 +271,138 @@ stm_input <- function(tokens, min_docfreq) {
   list(documents = documents, vocab = vocab)
 }
 
-# Topic-word probabilities as a matrix with the vocabulary as column names.
+# Everything stm needs, built once: documents, vocab, the paragraph metadata
+# in document order (a plain data frame), the year spline as columns
+# yr1, yr2, ..., and the prevalence formula.
+stm_setup <- function(paragraphs, min_docfreq, spline_df, drop = character()) {
+  s <- stm_input(clean_tokens(paragraphs, drop), min_docfreq)
+  meta <- tibble::tibble(para_uid = names(s$documents)) |>
+    dplyr::left_join(paragraphs, by = "para_uid")
+  bs <- splines::ns(meta$Year, df = spline_df)
+  colnames(bs) <- str_c("yr", seq_len(ncol(bs)))
+  c(s, list(meta = as.data.frame(cbind(meta, as.data.frame(bs))), bs = bs,
+            formula = as.formula(str_c("~ ", str_c(colnames(bs), collapse = " + ")))))
+}
+
+fit_stm <- function(s, K, documents = s$documents, vocab = s$vocab) {
+  stm::stm(documents, vocab, K = K, init.type = "Spectral",
+           prevalence = s$formula, data = s$meta, verbose = FALSE)
+}
+
+# Fit each K on most of the text and score it on the held-out rest.
+search_k <- function(s, K_grid, seed, workers) {
+  future::plan(future::multisession, workers = workers)
+  on.exit(future::plan(future::sequential))
+  ho <- stm::make.heldout(s$documents, s$vocab, seed = seed)
+  furrr::future_map(K_grid, function(k) {
+    fit <- fit_stm(s, k, ho$documents, ho$vocab)
+    tibble::tibble(K = k,
+                   heldout = stm::eval.heldout(fit, ho$missing)$expected.heldout,
+                   dispersion = stm::checkResiduals(fit, ho$documents)$dispersion,
+                   coherence = mean(stm::semanticCoherence(fit, ho$documents)),
+                   exclusivity = mean(stm::exclusivity(fit)))
+  }, .options = furrr::furrr_options(seed = seed)) |>
+    purrr::list_rbind()
+}
+
+plot_search_k <- function(metrics) {
+  metrics |>
+    tidyr::pivot_longer(-K) |>
+    ggplot(aes(K, value)) +
+    geom_line(color = viridis(1, begin = 0.35)) + geom_point() +
+    facet_wrap(~ name, scales = "free_y") + labs(y = NULL)
+}
+
+# Per paragraph: every topic share, the most likely topic and its share.
+# Per topic: prevalence, FREX and probable words, paragraphs, and AvePP.
+topic_tables <- function(fit, meta, keep_cols, n_words) {
+  theta <- fit$theta
+  colnames(theta) <- str_c("topic_", seq_len(ncol(theta)))
+  paragraph_theta <- tibble::as_tibble(meta[keep_cols]) |>
+    dplyr::bind_cols(tibble::as_tibble(theta)) |>
+    dplyr::mutate(topic = max.col(theta, ties.method = "first"),
+                  theta_max = theta[cbind(dplyr::row_number(), topic)])
+  words <- stm::labelTopics(fit, n = n_words)
+  topic_summary <- tibble::tibble(
+    topic = seq_len(ncol(theta)),
+    prevalence = colMeans(theta),
+    frex = apply(words$frex, 1, str_c, collapse = ", "),
+    prob = apply(words$prob, 1, str_c, collapse = ", ")) |>
+    dplyr::left_join(paragraph_theta |>
+                       dplyr::group_by(topic) |>
+                       dplyr::summarise(n_paras = dplyr::n(), avepp = mean(theta_max)),
+                     by = "topic")
+  entropy_r2 <- 1 - (-sum(theta * log(theta + 1e-12))) / (nrow(theta) * log(ncol(theta)))
+  list(paragraph_theta = paragraph_theta, topic_summary = topic_summary,
+       entropy_r2 = entropy_r2)
+}
+
+# Match each baseline topic to one topic of another fit (Hungarian
+# assignment on topic-word cosine over the shared vocabulary).
 beta_matrix <- function(fit) {
   b <- exp(fit$beta$logbeta[[1]])
   colnames(b) <- fit$vocab
   b
 }
 
-# Match each baseline topic to one topic of another fit (Hungarian
-# assignment on topic-word cosine over the shared vocabulary).
 match_topics <- function(b_ref, b_alt) {
   v <- intersect(colnames(b_ref), colnames(b_alt))
   a <- b_ref[, v, drop = FALSE]; b <- b_alt[, v, drop = FALSE]
   sim <- (a %*% t(b)) / outer(sqrt(rowSums(a^2)), sqrt(rowSums(b^2)))
-  m <- clue::solve_LSAP(sim, maximum = TRUE)
-  tibble::tibble(topic = seq_len(nrow(sim)), matched = as.integer(m),
-                 cosine = sim[cbind(seq_len(nrow(sim)), as.integer(m))],
-                 shared_vocab = length(v))
+  m <- as.integer(clue::solve_LSAP(sim, maximum = TRUE))
+  tibble::tibble(topic = seq_len(nrow(sim)), matched = m,
+                 cosine = sim[cbind(seq_len(nrow(sim)), m)])
 }
 
-# ---- 5. Trends over time ---------------------------------------------------------
+# ---- 5. Topic codebook -------------------------------------------------------
 
-# Standard errors clustered on comment, since paragraphs from one comment are
-# correlated (sandwich estimator written out to avoid a dependency).
+# One call per topic, in parallel, with the larger model. Each call sees only
+# that topic's words and its most typical paragraphs (`text` must be in
+# paragraph_theta). Written once: an existing file is read, never redrafted,
+# so hand edits survive.
+draft_codebook <- function(path, inputs, tables, source_desc, steps, home, n_examples) {
+  check_inputs(path, inputs)
+  if (file.exists(path)) return(readr::read_csv(path, show_col_types = FALSE))
+  ev <- tables$paragraph_theta |>
+    dplyr::group_by(topic) |>
+    dplyr::slice_max(theta_max, n = n_examples, with_ties = FALSE) |>
+    dplyr::summarise(ex = str_c("- ", str_trunc(text, 400), collapse = "\n")) |>
+    dplyr::right_join(tables$topic_summary, by = "topic") |>
+    dplyr::arrange(topic)
+  sys <- build_prompt(
+    role = "You are a survey methodologist who names statistical topics so colleagues can use them.",
+    task = str_c("Read one topic's words and example paragraphs from ", source_desc, ". Write a ",
+                 "short label, one factual sentence on what the paragraphs discuss, and one ",
+                 "proposition: a single claim, in one sentence, that a paragraph on this topic ",
+                 "could agree or disagree with. Check every word against the evidence."),
+    rules = c("Use only the words and paragraphs shown.",
+              "Do not infer who is speaking or their intent.",
+              "Do not invent statistics, dates, places, or names.",
+              "The proposition states one side only: never 'X over Y' or 'X rather than Y'.",
+              "If the evidence is mixed, say so plainly."),
+    output = "A label of at most 4 words, a one-sentence description, and a one-sentence proposition.")
+  type <- ellmer::type_object(
+    label = ellmer::type_string("At most 4 words."),
+    description = ellmer::type_string("One factual sentence."),
+    proposition = ellmer::type_string("One claim, one sentence."))
+  prompts <- str_c("Distinctive words: ", ev$frex, "\nMost probable words: ", ev$prob,
+                   "\nExample paragraphs:\n", ev$ex)
+  drafts <- ellmer::parallel_chat_structured(
+    make_chat("codebook", sys, steps, home), as.list(prompts), type = type,
+    max_active = 10L, on_error = "continue")
+  codebook <- dplyr::bind_cols(tibble::tibble(topic = ev$topic),
+                               dplyr::select(drafts, label, description, proposition))
+  readr::write_csv(codebook, path, na = "")
+  record_inputs(path, inputs)
+  if (anyNA(codebook$label))
+    warning(sum(is.na(codebook$label)), " topics got no label; name them by hand.")
+  codebook
+}
+
+# ---- 6. Trends over time -----------------------------------------------------
+
+# Standard errors clustered on document (comment or speech), since its
+# paragraphs are correlated. Sandwich estimator written out.
 cluster_vcov <- function(model, cluster) {
   X <- stats::model.matrix(model)
   u <- stats::residuals(model, type = "working") * stats::weights(model, "working")
@@ -366,13 +412,10 @@ cluster_vcov <- function(model, cluster) {
   bread %*% crossprod(S) %*% bread * G / (G - 1)
 }
 
-# Expected share of topic k by year. A fractional logit (quasibinomial glm on
-# the topic share; Papke and Wooldridge 1996) keeps every prediction between
-# 0 and 1, unlike the linear model in stm::estimateEffect, which can predict
-# negative shares. It is refit on each draw of theta from the fitted STM and
-# the draws are combined on the logit scale (mean, plus within- and
-# between-draw variance), so the interval carries the topic model's own
-# uncertainty as well as clustering by comment.
+# Expected share of topic k by year: a fractional logit (quasibinomial glm on
+# the topic share; Papke and Wooldridge 1996), refit on each draw of theta and
+# combined on the logit scale (Rubin's rules), so the interval carries the
+# topic model's uncertainty and the clustering.
 topic_trend <- function(draws, k, bs, grid, cluster) {
   X <- cbind(1, stats::predict(bs, newx = grid))
   fits <- purrr::map(draws, function(th) {
@@ -385,19 +428,26 @@ topic_trend <- function(draws, k, bs, grid, cluster) {
   est <- rowMeans(lp)
   se <- sqrt(rowMeans(v) + (1 + 1 / ncol(lp)) * apply(lp, 1, stats::var))
   tibble::tibble(Year = grid, topic = k, fit = stats::plogis(est),
-                 lo = stats::plogis(est - 1.96 * se),
-                 hi = stats::plogis(est + 1.96 * se))
+                 lo = stats::plogis(est - 1.96 * se), hi = stats::plogis(est + 1.96 * se))
 }
 
-# ---- 6. Tables for Typst ---------------------------------------------------------
-# Typst will not break a captioned table across pages, so long tables are
-# printed in blocks of `rows`. Chunks that call these need results: asis.
+topic_trends <- function(fit, s, n_draws, seed, cluster) {
+  draws <- withr::with_seed(seed, purrr::map(seq_len(n_draws), function(i)
+    do.call(rbind, stm::thetaPosterior(fit, nsims = 1, type = "Global"))))
+  grid <- sort(unique(s$meta$Year))
+  purrr::map(seq_len(ncol(fit$theta)), function(k)
+    topic_trend(draws, k, s$bs, grid, cluster)) |>
+    purrr::list_rbind()
+}
+
+# ---- 7. Tables and plots -----------------------------------------------------
+# Typst will not break a captioned table across pages, so long tables print
+# in blocks of `rows`. Chunks that call these need results: asis.
 
 tbl_paged <- function(df, caption = NULL, rows = 20L, max_chars = 60L) {
   d <- df |>
     dplyr::mutate(dplyr::across(dplyr::where(is.numeric), function(x) round(x, 3)),
-                  dplyr::across(dplyr::where(is.character),
-                                function(x) str_trunc(x, max_chars)))
+                  dplyr::across(dplyr::where(is.character), function(x) str_trunc(x, max_chars)))
   if (!is.null(caption)) writeLines(c("", str_c("**", caption, "**"), ""))
   split(d, (seq_len(nrow(d)) - 1L) %/% rows) |>
     purrr::walk(function(p) writeLines(c(knitr::kable(p, format = "pipe"), "")))
@@ -413,4 +463,21 @@ tbl_records <- function(df, title_col, body_cols, caption = NULL) {
                  str_c("- ", body_cols, ": ", unlist(r[body_cols])), ""))
   })
   invisible(df)
+}
+
+# Trend panels, nine topics per page, most prevalent first. `trends` needs
+# topic, Year, fit, lo, hi, label, prevalence.
+plot_trends <- function(trends) {
+  trends |>
+    dplyr::mutate(name = forcats::fct_reorder(str_c(topic, ". ", str_trunc(label, 24)),
+                                              -prevalence),
+                  page = (dplyr::dense_rank(dplyr::desc(prevalence)) - 1) %/% 9) |>
+    dplyr::group_split(page) |>
+    purrr::walk(function(d) print(
+      ggplot(d, aes(Year, fit)) +
+        geom_ribbon(aes(ymin = lo, ymax = hi), alpha = 0.2, fill = viridis(1, begin = 0.35)) +
+        geom_line(color = viridis(1, begin = 0.35)) +
+        facet_wrap(~ name, scales = "free_y", ncol = 3) +
+        scale_y_continuous(labels = scales::percent) +
+        labs(x = NULL, y = "estimated share")))
 }

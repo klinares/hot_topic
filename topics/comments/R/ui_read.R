@@ -42,12 +42,12 @@ mod_read_server <- function(id, hd) {
 
     output$count <- renderUI(tags$p(
       tags$strong(format(nrow(shown()), big.mark = ",")), " paragraphs from ",
-      tags$strong(format(dplyr::n_distinct(shown()$atom_id), big.mark = ",")),
+      tags$strong(format(dplyr::n_distinct(shown()$id), big.mark = ",")),
       " comments"))
 
     output$table <- DT::renderDT({
       d <- shown() |>
-        dplyr::transmute(Year, comment = atom_id, topic = paste0(topic, ". ", label),
+        dplyr::transmute(Year, comment = id, topic = paste0(topic, ". ", label),
                          theta = round(theta_max, 2), text)
       DT::datatable(d, rownames = FALSE, selection = "single",
                     options = list(pageLength = 10, scrollX = TRUE,
@@ -61,14 +61,14 @@ mod_read_server <- function(id, hd) {
 
     output$doc_title <- renderText({
       p <- picked()
-      if (is.null(p)) "Comment" else paste0("Comment ", p$atom_id, " (", p$Year, ")")
+      if (is.null(p)) "Comment" else paste0("Comment ", p$id, " (", p$Year, ")")
     })
 
     output$doc <- renderUI({
       p <- picked()
       if (is.null(p))
         return(tags$p(class = "text-muted", "Select a paragraph above."))
-      doc <- dplyr::filter(hd$paras, atom_id == p$atom_id)
+      doc <- dplyr::filter(hd$paras, id == p$id)
       tagList(purrr::pmap(doc, function(...) {
         r <- list(...)
         here <- identical(r$para_uid, p$para_uid)
@@ -85,15 +85,15 @@ mod_read_server <- function(id, hd) {
     output$dl_paras <- downloadHandler(
       filename = function() paste0("paragraphs_", Sys.Date(), ".csv"),
       content = function(f) readr::write_excel_csv(
-        dplyr::select(shown(), para_uid, atom_id, para_id, Year, topic, label,
+        dplyr::select(shown(), para_uid, id, para_id, Year, topic, label,
                       theta_max, text), f, na = ""))
 
     output$dl_docs <- downloadHandler(
       filename = function() paste0("comments_", Sys.Date(), ".csv"),
       content = function(f) readr::write_excel_csv(
         hd$paras |>
-          dplyr::semi_join(dplyr::distinct(shown(), atom_id), by = "atom_id") |>
-          dplyr::select(atom_id, para_id, Year, topic, label, theta_max, text),
+          dplyr::semi_join(dplyr::distinct(shown(), id), by = "id") |>
+          dplyr::select(id, para_id, Year, topic, label, theta_max, text),
         f, na = ""))
   })
 }

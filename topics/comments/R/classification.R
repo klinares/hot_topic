@@ -13,14 +13,14 @@ classification_banner <- function() {
     getOption("drsvyr.classification", "UNCLASSIFIED"))
 }
 
-# The office logo sits under the banner. Put the image in www/ and name it in
-# options(hot_topic.logo = "logo.png"). Until the file exists, a dashed box
+# The office logo sits under the banner. Put the image in logo/ and name it in
+# options(hot_topic.logo = "office_logo.png"). Until it exists, a dashed box
 # marks where it will go.
 office_logo <- function() {
-  f <- getOption("hot_topic.logo", "logo.png")
+  f <- getOption("hot_topic.logo", "office_logo.png")
   office <- getOption("hot_topic.office", "")
-  logo <- if (file.exists(file.path("www", f)))
-    tags$img(src = f, alt = "Office logo", style = "height:48px;") else
+  logo <- if (file.exists(file.path("logo", f)))
+    tags$img(src = file.path("logo", f), alt = "Office logo", style = "height:48px;") else
     tags$div(style = paste("height:48px; width:160px; border:2px dashed #adb5bd;",
                            "border-radius:4px; color:#6c757d; font-size:12px;",
                            "display:flex; align-items:center; justify-content:center;"),

@@ -13,10 +13,7 @@ execute:
 
 ```{r config}
 tx <- list(
-  # the paragraphs, as already parsed from the speeches: one row per paragraph
-  input_file = "unga_paragraphs.csv",  # in topics/unga/inputs/
-  cols = c(id = "id", year = "Year", para = "para_uid", text = "raw_text"),
-  # a paragraph is analyzed only if it reads as one
+  input_file = "unga_paragraphs.csv",  # in topics/unga/inputs/: id, Year, para_id, raw_text
   min_words = 20L,  # shorter paragraphs are headers or fragments
   procedural = c(  # the presiding officer's words, not the speaker's
     "will now hear an address", "request protocol to escort",
@@ -41,18 +38,13 @@ tx <- list(
     "codebook", "COMPASS_LARGE_URL", "COMPASS_LARGE_KEY", "LARGE-MODEL"))
 
 suppressPackageStartupMessages({
-  library(here); library(stm); library(splines); library(viridis)
+  library(stm); library(splines); library(viridis)
   library(tidyverse)  # tidyverse last so its verbs win
 })
 theme_set(theme_minimal(base_size = 12))
 set.seed(tx$seed)
-# this project's inputs/ and outputs/ live in topics/unga/
-options(hot_topic.project = file.path("topics", "unga"))
-source(here::here("topics", "topics_source.R"))  # the topics project's functions
-if (isTRUE(tx$use_openrouter)) {
-  source(here::here("topics", "llm_openrouter.R"))
-  tx$steps$model <- open_router_models[tx$steps$step]
-}
+source("../topics_source.R")  # shared functions, one folder up
+if (isTRUE(tx$use_openrouter)) source("../llm_openrouter.R")
 dir.create(p_out(), showWarnings = FALSE)
 ```
 
@@ -61,24 +53,19 @@ dir.create(p_out(), showWarnings = FALSE)
 ```{r input}
 #| results: asis
 raw_in <- p_in(tx$input_file)
-raw <- readr::read_csv(raw_in, show_col_types = FALSE, col_types = readr::cols(
-  .default = readr::col_character()))
-miss <- setdiff(unname(tx$cols), names(raw))
+raw <- readr::read_csv(raw_in, show_col_types = FALSE,
+                       col_types = readr::cols(.default = readr::col_character()))
+miss <- setdiff(c("id", "Year", "para_id", "raw_text"), names(raw))
 if (length(miss)) stop(tx$input_file, " is missing: ", str_c(miss, collapse = ", "))
-# Internally para_uid is the paragraph's key (speech-position), which is what
-# the shared functions expect; outputs give back your id and position.
+# para_id is the paragraph's position in the speech; para_uid is the unique
+# key "speech-position" the shared functions expect. `text` is a working copy with spaces collapsed, for screening and tokens
+# only; it is never written out, so raw_text stays exactly as parsed.
 all_paras <- raw |>
-  dplyr::transmute(id = .data[[tx$cols[["id"]]]],
-                   Year = as.integer(.data[[tx$cols[["year"]]]]),
-                   para_id = as.integer(.data[[tx$cols[["para"]]]]),
-                   # a working copy with spaces collapsed, for screening and
-                   # tokens only; it is never written out, so your raw_text
-                   # stays exactly as parsed
-                   text = str_squish(.data[[tx$cols[["text"]]]])) |>
-  dplyr::mutate(para_uid = str_c(id, "-", para_id))
+  dplyr::transmute(id, Year = as.integer(Year), para_id = as.integer(para_id),
+                   text = str_squish(raw_text), para_uid = str_c(id, "-", para_id))
 stopifnot("Year must be a whole number on every row" = !anyNA(all_paras$Year),
-          "para_uid must be the paragraph's position, a whole number" = !anyNA(all_paras$para_id),
-          "id + para_uid must be unique" = !anyDuplicated(all_paras$para_uid),
+          "para_id must be a whole number" = !anyNA(all_paras$para_id),
+          "id + para_id must be unique" = !anyDuplicated(all_paras$para_uid),
           "a speech id must have one year" =
             nrow(dplyr::distinct(all_paras, id, Year)) == dplyr::n_distinct(all_paras$id))
 writeLines(glue::glue("{format(nrow(all_paras), big.mark = ',')} paragraphs from \\
@@ -91,35 +78,30 @@ writeLines(glue::glue("{format(nrow(all_paras), big.mark = ',')} paragraphs from
 #| fig-cap: "Speeches in the corpus each year."
 all_paras |>
   dplyr::distinct(id, Year) |>
-  dplyr::count(Year) |>
-  ggplot(aes(Year, n)) +
-  geom_col(fill = viridis(1, begin = 0.35)) +
+  ggplot(aes(Year)) +
+  geom_bar(fill = viridis(1, begin = 0.35)) +
   labs(x = NULL, y = "speeches")
 ```
 
 # Which paragraphs are analyzed
 
-The paragraphs are used exactly as they were parsed from the speeches, so they line up with every other analysis of the same paragraphs. None is merged, split, or edited. A paragraph is left out, whole, if it
+The paragraphs are used exactly as they were parsed, so they line up with every other analysis of the same paragraphs. None is merged, split, or edited. A paragraph is left out, whole, if it
 
-1. **has no complete sentence**: no sentence ending in a period, question mark, or exclamation mark. These are headers, labels, dates, and lines such as "Meeting/Event" or "[Auto-generated transcript]";
-2. **is the presiding officer speaking**: introducing the speaker or thanking them, matched by the phrases in `tx$procedural`;
-3. **is shorter than `r tx$min_words` words**: salutations and fragments that carry no subject.
+1. **has no complete sentence**: nothing ending in a period, question mark, or exclamation mark (headers, labels, dates);
+2. **is the presiding officer speaking**: matched by the phrases in `tx$procedural`;
+3. **is shorter than `r tx$min_words` words**: salutations and fragments.
 
 ```{r screen}
 #| results: asis
-procedural_rx <- str_c(tx$procedural, collapse = "|")
 screened <- all_paras |>
-  dplyr::mutate(
-    n_words = str_count(text, "\\S+"),
-    reason = dplyr::case_when(
-      is.na(text) | text == "" ~ "empty",
-      !str_detect(text, "[.!?][\"')\\]]*(\\s|$)") ~ "no complete sentence",
-      str_detect(str_to_lower(text), procedural_rx) ~ "presiding officer",
-      n_words < tx$min_words ~ str_c("under ", tx$min_words, " words"),
-      TRUE ~ NA_character_))
+  dplyr::mutate(reason = dplyr::case_when(
+    is.na(text) | text == "" ~ "empty",
+    !str_detect(text, "[.!?][\"')\\]]*(\\s|$)") ~ "no complete sentence",
+    str_detect(str_to_lower(text), str_c(tx$procedural, collapse = "|")) ~ "presiding officer",
+    str_count(text, "\\S+") < tx$min_words ~ str_c("under ", tx$min_words, " words")))
 paragraphs <- dplyr::filter(screened, is.na(reason))
 dropped <- dplyr::filter(screened, !is.na(reason))
-arrow::write_parquet(dplyr::select(dropped, id, para_uid = para_id, Year, reason),
+arrow::write_parquet(dplyr::select(dropped, id, para_id, Year, reason),
                      p_out("dropped_paragraphs.parquet"))
 
 dplyr::count(screened, reason = dplyr::coalesce(reason, "analyzed"), name = "paragraphs") |>
@@ -157,165 +139,74 @@ Words are lowercased and kept only if purely alphabetic. Stopwords, month and we
 
 ```{r dtm}
 #| results: asis
-tokens <- clean_tokens(paragraphs, tx$drop_words)
-stm_in <- stm_input(tokens, tx$min_docfreq)
-# stm needs a plain data frame in the same row order as the documents, with
-# the year spline as ordinary columns yr1, yr2, ...
-meta <- tibble(para_uid = names(stm_in$documents)) |>
-  dplyr::left_join(paragraphs, by = "para_uid") |>
-  as.data.frame()
-bs <- splines::ns(meta$Year, df = tx$spline_df)
-colnames(bs) <- str_c("yr", seq_len(ncol(bs)))
-meta <- cbind(meta, as.data.frame(bs))
-prev_form <- as.formula(str_c("~ ", str_c(colnames(bs), collapse = " + ")))
-writeLines(glue::glue("{format(length(stm_in$documents), big.mark = ',')} paragraphs and \\
-  {format(length(stm_in$vocab), big.mark = ',')} words enter the model; \\
-  {nrow(paragraphs) - length(stm_in$documents)} paragraphs had no word left."))
+s <- stm_setup(paragraphs, tx$min_docfreq, tx$spline_df, tx$drop_words)
+writeLines(glue::glue("{format(length(s$documents), big.mark = ',')} paragraphs and \\
+  {format(length(s$vocab), big.mark = ',')} words enter the model; \\
+  {nrow(paragraphs) - length(s$documents)} paragraphs had no word left."))
 ```
 
 # How many topics
 
-Each candidate number of topics is fitted on most of the text and scored on the rest. Take the smallest number where held-out likelihood has flattened and residual dispersion has stopped falling, then break ties on coherence and exclusivity. The first pass is broad; narrow `K_grid` around the best values and run again. Each grid is saved under its own name, so the passes do not overwrite each other.
+Take the smallest number where held-out likelihood has flattened and residual dispersion has stopped falling, then break ties on coherence and exclusivity. The first pass is broad; narrow `K_grid` around the best values and run again. Each grid is saved under its own name.
 
 ```{r searchK}
 if (isTRUE(tx$run_searchK)) {
   grid_file <- p_out(str_c("searchK_", min(tx$K_grid), "-", max(tx$K_grid), "_",
                            length(tx$K_grid), ".parquet"))
-  future::plan(future::multisession, workers = tx$workers)
-  ho <- stm::make.heldout(stm_in$documents, stm_in$vocab, seed = tx$seed)
-  metrics <- cached(grid_file, raw_in,
-    furrr::future_map(tx$K_grid, function(k) {
-      fit <- stm::stm(ho$documents, ho$vocab, K = k, init.type = "Spectral",
-                      prevalence = prev_form, data = meta, verbose = FALSE)
-      tibble(K = k,
-             heldout = stm::eval.heldout(fit, ho$missing)$expected.heldout,
-             dispersion = stm::checkResiduals(fit, ho$documents)$dispersion,
-             coherence = mean(stm::semanticCoherence(fit, ho$documents)),
-             exclusivity = mean(stm::exclusivity(fit)))
-    }, .options = furrr::furrr_options(seed = tx$seed)) |> purrr::list_rbind())
-  future::plan(future::sequential)
-  metrics |>
-    tidyr::pivot_longer(-K) |>
-    ggplot(aes(K, value)) +
-    geom_line(color = viridis(1, begin = 0.35)) + geom_point() +
-    facet_wrap(~ name, scales = "free_y") + labs(y = NULL)
+  cached(grid_file, raw_in, search_k(s, tx$K_grid, tx$seed, tx$workers)) |>
+    plot_search_k()
 } else glue::glue("Search skipped; K = {tx$K}.")
 ```
 
 # The topics
 
-Year enters topic prevalence as a spline, so each topic's share can rise and fall over the period. Spectral initialization makes the fit reproducible. The fit is saved as `stm_fit.rds` and reloaded on later renders; delete it to refit.
+Year enters topic prevalence as a spline, so each topic's share can rise and fall. Spectral initialization makes the fit reproducible. The fit is saved as `stm_fit.rds` and reloaded later; delete it to refit.
 
 ```{r stm-fit}
-stm_fit <- cached(p_out("stm_fit.rds"), raw_in,
-  stm::stm(stm_in$documents, stm_in$vocab, K = tx$K, init.type = "Spectral",
-           prevalence = prev_form, data = meta, verbose = FALSE))
+stm_fit <- cached(p_out("stm_fit.rds"), raw_in, fit_stm(s, tx$K))
 K <- ncol(stm_fit$theta)
 if (K != tx$K) stop("stm_fit.rds has K = ", K, " but tx$K = ", tx$K,
                     ". Delete stm_fit.rds, then re-render.")
-theta <- stm_fit$theta
-colnames(theta) <- str_c("topic_", seq_len(K))
 ```
 
 Each paragraph is assigned its most likely topic. **Entropy R²** (0 to 1) says how sharply paragraphs sort into topics overall; **AvePP** is the average topic share among a topic's own paragraphs, with about 0.7 the usual floor.
 
 ```{r modal}
 #| results: asis
-paragraph_theta <- meta |>
-  dplyr::select(para_uid, id, para_id, Year) |>
-  dplyr::bind_cols(tibble::as_tibble(theta)) |>
-  dplyr::mutate(topic = max.col(theta, ties.method = "first"),
-                theta_max = theta[cbind(dplyr::row_number(), topic)])
-entropy_r2 <- 1 - (-sum(theta * log(theta + 1e-12))) / (nrow(theta) * log(K))
-
-words <- stm::labelTopics(stm_fit, n = tx$n_words)
-topic_summary <- tibble(
-  topic = seq_len(K),
-  prevalence = colMeans(theta),
-  frex = apply(words$frex, 1, str_c, collapse = ", "),
-  prob = apply(words$prob, 1, str_c, collapse = ", ")) |>
-  dplyr::left_join(paragraph_theta |>
-                     dplyr::group_by(topic) |>
-                     dplyr::summarise(n_paras = dplyr::n(), avepp = mean(theta_max)),
-                   by = "topic")
-
-# Outputs carry no text: they join back to the paragraphs on id + para_uid.
-# Shares are rounded to 4 decimals, which keeps the file small.
+tables <- topic_tables(stm_fit, s$meta, c("para_uid", "id", "para_id", "Year", "text"),
+                       tx$n_words)
+# Outputs carry no text: they join back to the input on id + para_id.
 theta_out <- p_out("paragraph_topics.parquet")
-paragraph_theta |>
-  dplyr::transmute(id, para_uid = para_id, Year, topic, theta_max = round(theta_max, 4),
-                   dplyr::across(dplyr::starts_with("topic_"), function(x) round(x, 4))) |>
+tables$paragraph_theta |>
+  dplyr::transmute(id, para_id, Year, topic, theta_max,
+                   dplyr::across(dplyr::starts_with("topic_"))) |>
+  dplyr::mutate(dplyr::across(c(theta_max, dplyr::starts_with("topic_")), function(x) round(x, 4))) |>
   arrow::write_parquet(theta_out)
-arrow::write_parquet(topic_summary, p_out("topic_summary.parquet"))
-
-writeLines(glue::glue("Entropy R2 = {round(entropy_r2, 3)}. \\
-  Topics with AvePP under 0.7: {sum(topic_summary$avepp < 0.7, na.rm = TRUE)} of {K}."))
+arrow::write_parquet(tables$topic_summary, p_out("topic_summary.parquet"))
+writeLines(glue::glue("Entropy R2 = {round(tables$entropy_r2, 3)}. Topics with AvePP \\
+  under 0.7: {sum(tables$topic_summary$avepp < 0.7, na.rm = TRUE)} of {K}."))
 ```
 
 ## Topic labels
 
-One call per topic, all in parallel, with the larger model. Each call sees only that topic's evidence: its `r tx$n_words` most distinctive (FREX) and most probable words and its `r tx$n_examples` most typical paragraphs. It drafts a label, a one-sentence description, and a proposition a speaker could take a side on. The file is written once: if `topic_codebook.csv` exists it is read, not redrafted, so your edits survive. Delete it to redraft.
+One call per topic, in parallel, with the larger model. Each call sees only that topic's `r tx$n_words` most distinctive (FREX) and most probable words and its `r tx$n_examples` most typical paragraphs. If `topic_codebook.csv` exists it is read, not redrafted, so your edits survive. Delete it to redraft.
 
 ```{r codebook}
 #| results: asis
-cb_path <- p_out("topic_codebook.csv")
-check_inputs(cb_path, theta_out)
-if (file.exists(cb_path)) {
-  codebook <- readr::read_csv(cb_path, show_col_types = FALSE)
-  writeLines(glue::glue("Existing codebook read ({nrow(codebook)} topics); no calls made."))
-} else {
-  examples <- paragraph_theta |>
-    dplyr::left_join(dplyr::select(paragraphs, para_uid, text), by = "para_uid") |>
-    dplyr::group_by(topic) |>
-    dplyr::slice_max(theta_max, n = tx$n_examples, with_ties = FALSE) |>
-    dplyr::summarise(ex = str_c("- ", str_trunc(text, 400), collapse = "\n"))
-  ev <- dplyr::left_join(topic_summary, examples, by = "topic")
-  sys <- build_prompt(
-    role = "You are a survey methodologist who names statistical topics so colleagues can use them.",
-    task = str_c("Read one topic's words and example paragraphs from speeches in the general ",
-                 "debate of the UN General Assembly. Write a short label, one factual sentence ",
-                 "on what the paragraphs discuss, and one proposition: a single claim, in one ",
-                 "sentence, that a paragraph on this topic could agree or disagree with. Check ",
-                 "every word against the evidence."),
-    rules = c("Use only the words and paragraphs shown.",
-              "Do not infer which country is speaking or its intent.",
-              "Do not invent statistics, dates, places, or names.",
-              "The proposition states one side only: never 'X over Y' or 'X rather than Y'.",
-              "If the evidence is mixed, say so plainly."),
-    output = "A label of at most 4 words, a one-sentence description, and a one-sentence proposition.")
-  type <- ellmer::type_object(
-    label = ellmer::type_string("At most 4 words."),
-    description = ellmer::type_string("One factual sentence."),
-    proposition = ellmer::type_string("One claim, one sentence."))
-  prompts <- str_c("Distinctive words: ", ev$frex, "\nMost probable words: ", ev$prob,
-                   "\nExample paragraphs:\n", ev$ex)
-  drafts <- ask_many(make_chat("codebook", sys, tx$steps, tx$use_openrouter),
-                     prompts, type)
-  codebook <- tibble(topic = ev$topic, label = drafts$label,
-                     description = drafts$description,
-                     proposition = drafts$proposition) |>
-    dplyr::arrange(topic)
-  readr::write_csv(codebook, cb_path, na = "")
-  record_inputs(cb_path, theta_out)
-  if (anyNA(codebook$label))
-    warning(sum(is.na(codebook$label)), " topics got no label; name them by hand.")
-}
+codebook <- draft_codebook(p_out("topic_codebook.csv"), theta_out, tables,
+                           "speeches in the general debate of the UN General Assembly",
+                           tx$steps, tx$use_openrouter, tx$n_examples)
 dup <- codebook |> dplyr::add_count(label) |> dplyr::filter(n > 1, !is.na(label))
 if (nrow(dup)) writeLines(glue::glue("**Duplicate labels to fix:** \\
   {str_c('topic ', dup$topic, ' (', dup$label, ')', collapse = ', ')}."))
 
-topic_summary |>
-  dplyr::left_join(dplyr::select(codebook, topic, label), by = "topic") |>
-  dplyr::arrange(dplyr::desc(prevalence)) |>
+summary_lab <- tables$topic_summary |>
+  dplyr::left_join(dplyr::select(codebook, topic, label, description, proposition), by = "topic") |>
+  dplyr::arrange(dplyr::desc(prevalence))
+summary_lab |>
   dplyr::transmute(topic, label, prevalence, paragraphs = n_paras, avepp) |>
   tbl_paged(caption = "Topics by the share of text they take up, most first.")
-```
-
-```{r codebook-records}
-#| results: asis
-codebook |>
-  dplyr::left_join(dplyr::select(topic_summary, topic, frex, prevalence), by = "topic") |>
-  dplyr::arrange(dplyr::desc(prevalence)) |>
+summary_lab |>
   dplyr::mutate(title = str_c("Topic ", topic, ": ", label)) |>
   tbl_records("title", c("description", "proposition", "frex"),
               caption = "Topic codebook. Edit the CSV; nothing redrafts it.")
@@ -326,26 +217,18 @@ codebook |>
 For each topic, its share of each paragraph is regressed on the year spline with a fractional logit (Papke and Wooldridge 1996), so every estimated share stays between 0 and 1. The model is refit on `r tx$n_draws` draws of the topic shares and the results combined, so the 95 percent intervals include the topic model's own uncertainty and the clustering of paragraphs within a speech. The set of countries speaking changes slightly from year to year, so a trend mixes change in what speakers say with change in who spoke.
 
 ```{r effects}
-draws <- withr::with_seed(tx$seed, purrr::map(seq_len(tx$n_draws), function(i)
-  do.call(rbind, stm::thetaPosterior(stm_fit, nsims = 1, type = "Global"))))
-grid <- sort(unique(meta$Year))
-topic_trends <- purrr::map(seq_len(K), function(k)
-  topic_trend(draws, k, bs, grid, meta$id)) |>
-  purrr::list_rbind()
-rm(draws)
-arrow::write_parquet(dplyr::mutate(topic_trends, dplyr::across(c(fit, lo, hi), function(x) round(x, 5))),
+trends <- topic_trends(stm_fit, s, tx$n_draws, tx$seed, s$meta$id)
+arrow::write_parquet(dplyr::mutate(trends, dplyr::across(c(fit, lo, hi), function(x) round(x, 5))),
                      p_out("topic_trends.parquet"))
-labelled <- topic_trends |>
-  dplyr::left_join(dplyr::select(codebook, topic, label), by = "topic") |>
-  dplyr::left_join(dplyr::select(topic_summary, topic, prevalence), by = "topic") |>
-  dplyr::mutate(name = str_c(topic, ". ", str_trunc(label, 24)))
+labelled <- dplyr::left_join(trends, dplyr::select(summary_lab, topic, label, prevalence),
+                             by = "topic")
 ```
 
 ```{r heat}
 #| fig-height: 8
 #| fig-cap: "Estimated share of attention by year, one row per topic, most prevalent at the top. Read it for timing: when a topic rose, peaked, and faded."
 labelled |>
-  dplyr::mutate(name = forcats::fct_reorder(name, prevalence)) |>
+  dplyr::mutate(name = forcats::fct_reorder(str_c(topic, ". ", str_trunc(label, 24)), prevalence)) |>
   ggplot(aes(Year, name, fill = fit)) +
   geom_tile() +
   scale_fill_viridis_c(name = "share", labels = scales::percent) +
@@ -354,16 +237,15 @@ labelled |>
 
 ```{r change}
 #| results: asis
-first_y <- min(grid); last_y <- max(grid)
+first_y <- min(labelled$Year); last_y <- max(labelled$Year)
 change <- labelled |>
   dplyr::group_by(topic, label) |>
-  dplyr::summarise(
-    start = mean(fit[Year <= first_y + 2]),
-    end = mean(fit[Year >= last_y - 2]),
-    peak_year = Year[which.max(fit)],
-    last = fit[Year == last_y],
-    before_last = mean(fit[Year >= last_y - 5 & Year < last_y]),
-    .groups = "drop") |>
+  dplyr::summarise(start = mean(fit[Year <= first_y + 2]),
+                   end = mean(fit[Year >= last_y - 2]),
+                   peak_year = Year[which.max(fit)],
+                   last = fit[Year == last_y],
+                   before_last = mean(fit[Year >= last_y - 5 & Year < last_y]),
+                   .groups = "drop") |>
   dplyr::mutate(change = end - start, last_vs_before = last - before_last)
 change |>
   dplyr::arrange(dplyr::desc(change)) |>
@@ -372,7 +254,7 @@ change |>
                    !!glue::glue("{first_y}-{first_y + 2}") := scales::percent(start, 0.1),
                    !!glue::glue("{last_y - 2}-{last_y}") := scales::percent(end, 0.1),
                    `change (points)` = round(100 * change, 1), `peak year` = peak_year) |>
-  tbl_paged(caption = glue::glue("The five topics that gained the most attention between the first and last three years, then the five that lost the most. Estimated shares from the trend model."))
+  tbl_paged(caption = "The five topics that gained the most attention between the first and last three years, then the five that lost the most.")
 change |>
   dplyr::arrange(dplyr::desc(abs(last_vs_before))) |>
   dplyr::slice_head(n = 8) |>
@@ -380,22 +262,13 @@ change |>
                    !!as.character(last_y) := scales::percent(last, 0.1),
                    !!glue::glue("{last_y - 5}-{last_y - 1} average") := scales::percent(before_last, 0.1),
                    `difference (points)` = round(100 * last_vs_before, 1)) |>
-  tbl_paged(caption = glue::glue("{last_y} against the five years before it: the eight topics that differ most. {last_y} is the last year on the curve, where the trend leans on earlier years; read these alongside the plots."))
+  tbl_paged(caption = glue::glue("{last_y} against the five years before it: the eight topics that differ most. {last_y} is the last year on the curve, where the trend leans on earlier years."))
 ```
 
 ```{r trend-plots}
 #| fig-height: 8
 #| fig-cap: "Estimated share of attention by year with 95 percent intervals, nine topics per page, most prevalent first. Each panel has its own scale."
-pages <- labelled |>
-  dplyr::mutate(page = (dplyr::dense_rank(dplyr::desc(prevalence)) - 1) %/% 9) |>
-  dplyr::group_split(page)
-purrr::walk(pages, function(d) print(
-  ggplot(d, aes(Year, fit)) +
-    geom_ribbon(aes(ymin = lo, ymax = hi), alpha = 0.2, fill = viridis(1, begin = 0.35)) +
-    geom_line(color = viridis(1, begin = 0.35)) +
-    facet_wrap(~ forcats::fct_reorder(name, -prevalence), scales = "free_y", ncol = 3) +
-    scale_y_continuous(labels = scales::percent) +
-    labs(x = NULL, y = "estimated share")))
+plot_trends(labelled)
 ```
 
 # Findings
@@ -416,8 +289,8 @@ purrr::walk(pages, function(d) print(
 
 # How to read these numbers
 
-- **Topics are found, not chosen.** The model groups words that appear together; the labels are drafted by a language model from each topic's words and paragraphs and checked by hand. A topic with low AvePP mixes subjects; read its paragraphs before relying on its trend.
+- **Topics are found, not chosen.** The model groups words that appear together; the labels are drafted by a language model and checked by hand. A topic with low AvePP mixes subjects; read its paragraphs before relying on its trend.
 - **Shares are shares of paragraphs.** A long speech contributes more than a short one, and a country that speaks every year more than one that does not.
-- **Trends are smoothed.** The curve leans on neighboring years, most of all at 2000 and at `r max(grid)`, the first and last years.
-- **Transcripts may contain errors.** Speeches are auto-generated transcripts; misheard words become noise in the topics.
+- **Trends are smoothed.** The curve leans on neighboring years, most of all at the first and last years.
+- **Transcripts may contain errors.** Misheard words become noise in the topics.
 - **Composition.** Who speaks changes slightly from year to year, so a trend mixes change in what is said with change in who said it.

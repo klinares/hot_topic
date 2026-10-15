@@ -1,7 +1,9 @@
-# app.R: the topics dashboard. It reads the four CSVs that topics.qmd writes
-# from outputs/ and never refits anything or calls a model.
+# app.R: the dashboard for this project's topics. It reads the CSVs that
+# topics.qmd writes to outputs/ and the PDFs that Quarto renders to reports/,
+# in this same folder, so nothing is copied. It never refits or calls a model.
 #
-# On Posit Connect, publish app.R, R/, outputs/, and www/.
+# On Posit Connect, publish app.R, R/, reports/, logo/, and from outputs/ only
+# paragraph_theta.csv, topic_codebook.csv, topic_summary.csv, topic_trends.csv.
 
 library(shiny)
 options(bitmapType = "cairo")  # the work server has no X11
@@ -9,7 +11,7 @@ options(bitmapType = "cairo")  # the work server has no X11
 # ---- deployment settings -----------------------------------------------------
 options(
   drsvyr.classification = "UNCLASSIFIED",            # the banner on every page
-  hot_topic.logo = "logo.png",                       # in www/; a placeholder until it exists
+  hot_topic.logo = "office_logo.png",                # in logo/; a placeholder until it exists
   hot_topic.office = "",                             # office name beside the logo, if wanted
   hot_topic.source = "public comments",              # what the text is, in a phrase
   hot_topic.unit = c("comment", "comments"),         # one document, and many
@@ -17,9 +19,11 @@ options(
 
 purrr::walk(list.files("R", pattern = "\\.R$", full.names = TRUE), source)
 
-# read once per R process, shared by every session; HOT_TOPIC_DATA points
-# elsewhere if the CSVs are not in outputs/
-hd <- load_outputs(Sys.getenv("HOT_TOPIC_DATA", "outputs"))
+# Shiny serves only www/ by itself; these two folders are served by name.
+addResourcePath("reports", "reports")
+addResourcePath("logo", "logo")
+
+hd <- load_outputs("outputs")  # read once per R process, shared by every session
 
 ui <- bslib::page(
   title = "Topics",
