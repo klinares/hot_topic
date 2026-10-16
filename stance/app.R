@@ -6,11 +6,16 @@
 #
 # On Posit Connect:
 #   - set "Max connections per process" to 1, because a run holds the R process
-#   - publish app.R and R/ only; inputs/ and outputs/ are not needed
+#   - publish app.R, R/, and logo/; inputs/ and outputs/ are not needed
 
 library(shiny)
 options(bitmapType = "cairo")  # the work server has no X11
 options(shiny.maxRequestSize = 500 * 1024^2)  # uploads up to 500 MB
+
+# The office logo, as in the topics dashboard: the file in logo/, and an office
+# name beside it if wanted. Until the file exists, a dashed box shows its place.
+options(hot_topic.logo = "office_logo.png",
+        hot_topic.office = "")
 
 # The model every passage is sent to. The key stays NULL: the work server needs
 # none, and a key is never typed here. Where one is needed (at home), NULL
@@ -37,10 +42,14 @@ options(stance.sec_per_passage = 0.1)
 
 purrr::walk(list.files("R", pattern = "\\.R$", full.names = TRUE), source)
 
+# Shiny serves only www/ by itself; logo/ is served by name.
+addResourcePath("logo", "logo")
+
 ui <- bslib::page(
   title = "stance",
   theme = bslib::bs_theme(version = 5, bootswatch = "flatly"),
   classification_banner(),
+  office_logo(),
   bslib::navset_bar(
     title = "stance", id = "nav",
     bslib::nav_panel("Start here", stance_help_ui()),
