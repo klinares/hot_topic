@@ -29,7 +29,12 @@ mod_stance_ui <- function(id) {
       fileInput(ns("file"), NULL, accept = c(".csv", "text/csv"),
                 buttonLabel = "CSV file", placeholder = "no file"),
       uiOutput(ns("cols")),
-      tags$h5("2. Your claim"),
+      tags$h5("2. What to measure"),
+      selectInput(ns("scheme"), NULL, width = "100%",
+                  choices = purrr::map_chr(stance_schemes, "name") |>
+                    (function(x) stats::setNames(names(x), x))()),
+      uiOutput(ns("scheme_help")),
+      tags$h6("Your claim"),
       textAreaInput(ns("prop"), NULL, rows = 3, width = "100%",
                     placeholder = "One sentence that states one side"),
       tags$p(class = "small text-muted mb-1", "Or use an example:"),
@@ -75,10 +80,9 @@ mod_stance_check_ui <- function(id) {
       width = 400,
       tags$h5("1. Code the sheet by hand"),
       tags$p(class = "small",
-             "Open the sheet of 400 passages from Detect stance. Put one of ",
-             tags$code("favor"), ", ", tags$code("neutral"), ", ",
-             tags$code("oppose"), ", ", tags$code("irrelevant"),
-             " in the ", tags$code("hand_label"), " column. Judge the same claim, ",
+             "Open the sheet of 400 passages from Detect stance. Put one of the ",
+             "labels listed in its ", tags$code("choose_from"), " column in the ",
+             tags$code("hand_label"), " column. Judge the same claim, ",
              "by the same rules the model was given. Leave a row blank to skip it. ",
              "Do not change ", tags$code("stance_run"), " or ", tags$code("stance_row"), "."),
       tags$h5("2. Upload both files"),
@@ -129,6 +133,17 @@ mod_stance_server <- function(id) {
 
     purrr::iwalk(stance_examples, function(x, i)
       observeEvent(input[[paste0("ex", i)]], updateTextAreaInput(session, "prop", value = x)))
+
+    sch <- reactive(stance_scheme(input$scheme %|_|% "favor"))
+    output$scheme_help <- renderUI({
+      s <- sch()
+      tags$div(class = "small text-muted mb-2",
+        tags$p(class = "mb-1", s$use),
+        tags$ul(class = "mb-0", purrr::imap(stance_codes(s), function(l, i) {
+          means <- c(s$means, irrelevant = "does not address the claim")
+          tags$li(tags$strong(l, .noWS = "after"), ": ", means[[l]])
+        })))
+    })
 
     # ---- the uploaded file ---------------------------------------------------
     raw <- reactive({
@@ -234,6 +249,7 @@ mod_stance_server <- function(id) {
         showNotification("Upload a CSV first.", type = "warning")
         return()
       }
+      s <- sch()
       prop <- trimws(input$prop %||% "")
       if (lengths(strsplit(prop, "\\s+")) < 5) {
         showNotification("Write the claim as a full sentence.", type = "warning")
@@ -249,13 +265,13 @@ mod_stance_server <- function(id) {
       })
       req(ep)
       todo <- dplyr::filter(p, keep)
-      prompt <- stance_prompt(prop, trimws(input$kind %||% "") %|_|%
+      prompt <- stance_prompt(s, prop, trimws(input$kind %||% "") %|_|%
                                 "short text passages")
       t0 <- Sys.time()
       # code_all reports after every chunk of requests, so the bar moves while
       # they run in parallel
       lab <- withProgress(message = "Reading passages", value = 0, tryCatch(
-        code_all(todo$text, prompt, ep, workers, on_step = function(i, n)
+        code_all(todo$text, prompt, ep, s, workers, on_step = function(i, n)
           setProgress(i / n, detail = sprintf("%s of %s unique", format(i, big.mark = ","),
                                               format(n, big.mark = ",")))),
         error = function(e) {
@@ -265,8 +281,8 @@ mod_stance_server <- function(id) {
       req(lab)
       todo$label <- lab
       coded <- dplyr::filter(todo, !is.na(label))
-      static <- stance_static(coded)
-      trends <- if ("time" %in% names(coded)) stance_trends(coded) else NULL
+      static <- stance_static(coded, s)
+      trends <- if ("time" %in% names(coded)) stance_trends(coded, s) else NULL
       counts <- list(total = nrow(p), coded = nrow(coded),
                      excluded = sum(!p$keep) + sum(is.na(todo$label)),
                      documents = dplyr::n_distinct(coded$cluster))
@@ -277,17 +293,17 @@ mod_stance_server <- function(id) {
                          by = "stance_row") |>
         dplyr::left_join(dplyr::select(p, stance_row, stance_words = n_words,
                                        stance_excluded = why), by = "stance_row") |>
-        dplyr::mutate(stance_claim = prop, stance_model = ep$model,
+        dplyr::mutate(stance_scheme = s$id, stance_claim = prop, stance_model = ep$model,
                       stance_date = as.character(Sys.Date()))
-      run(list(prop = prop, prompt = prompt, ep = ep, counts = counts,
+      run(list(scheme = s, prop = prop, prompt = prompt, ep = ep, counts = counts,
                coded = coded, static = static, trends = trends,
                notes = attr(trends, "notes"),
                minutes = as.numeric(difftime(Sys.time(), t0, units = "mins")),
                # the three files, built once so the buttons only write them
                labeled = labeled,
-               estimates = stance_record(stance_table(static, trends), prop,
+               estimates = stance_record(stance_table(static, trends), s, prop,
                                          prompt, ep, counts),
-               sheet = stance_sheet(coded, prop, run_id)))
+               sheet = stance_sheet(coded, s, prop, run_id)))
     })
 
     # ---- results -------------------------------------------------------------
@@ -328,14 +344,17 @@ mod_stance_server <- function(id) {
               plotOutput(ns("plot_dir"), height = 280))
     })
 
-    output$plot_static <- renderPlot(stance_plot_static(req(run())$static))
+    output$plot_static <- renderPlot({
+      r <- req(run())
+      stance_plot_static(r$static, r$scheme)
+    })
     output$plot_sal <- renderPlot({
       r <- req(run())
-      stance_plot_salience(r$trends, stance_observed(r$coded))
+      stance_plot_salience(r$trends, stance_observed(r$coded, r$scheme))
     })
     output$plot_dir <- renderPlot({
       r <- req(run())
-      stance_plot_direction(r$trends, stance_observed(r$coded))
+      stance_plot_direction(r$trends, stance_observed(r$coded, r$scheme), r$scheme)
     })
 
     output$overall_head <- renderUI({
@@ -387,13 +406,13 @@ mod_stance_server <- function(id) {
       m <- tryCatch(stance_match(labeled, sheet), error = function(e) e)
       if (inherits(m, "error")) return(fail(conditionMessage(m)))
       if (length(attr(m, "ignored")))
-        showNotification(paste("Ignoring labels that are not one of the four:",
+        showNotification(paste("Ignoring labels that are not in this scheme:",
                                paste(attr(m, "ignored"), collapse = ", ")),
                          type = "warning", duration = NULL)
-      a <- tryCatch(stance_agreement(m$hand_label, m$label, m$document),
+      a <- tryCatch(stance_agreement(m$hand_label, m$label, m$document, attr(m, "scheme")),
                     error = function(e) e)
       if (inherits(a, "error")) return(fail(conditionMessage(a)))
-      c(a, list(run = attr(m, "run"), claim = attr(m, "claim"),
+      c(a, list(run = attr(m, "run"), claim = attr(m, "claim"), scheme = attr(m, "scheme"),
                 model = attr(m, "model"), date = attr(m, "date")))
     })
 
@@ -402,6 +421,7 @@ mod_stance_server <- function(id) {
       k <- a$kappa
       tagList(
         tags$p(class = "small",
+               tags$strong("Scheme: "), a$scheme$name, tags$br(),
                tags$strong("Claim: "), tags$em(a$claim %|_|% "not recorded"), tags$br(),
                tags$strong("Model: "), a$model %|_|% "not recorded", " | ",
                tags$strong("Run: "), a$run, " | ", tags$strong("Coded on: "),

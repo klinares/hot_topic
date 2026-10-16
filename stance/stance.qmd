@@ -7,6 +7,7 @@ format:
     fig-width: 9
     fig-height: 5
 execute:
+  echo: false
   warning: false
   message: false
 ---
@@ -14,17 +15,20 @@ execute:
 ```{r config}
 st <- list(
   # the corpus to code: a CSV in stance/inputs, one passage per row
-  file = "paragraph_theta.csv",
+  file = "comments_periods.csv",
   text_col = "text",
-  time_col = "Year",  # "" for a static estimate
-  doc_col = "atom_id",  # "" when every row is independent
-  text_kind = "paragraphs from public comments",
+  time_col = "period",  # "" for a static estimate
+  doc_col = "id",  # "" when every row is independent
+  text_kind = "paragraphs from presidential inaugural addresses",
+  # what to measure: "favor", "agree", or "align" (see stance_schemes)
+  scheme = "favor",
   proposition = "The United States should take an active role in the affairs of other nations.",
   name = "world_role",  # short name for this claim's output files
   hand_file = "",  # a CSV of hand codes in stance/inputs, to check the labels
-  url = "http://YOUR-GEMMA-HOST:8000/v1",  # the model's base URL, ending in /v1
-  model = "YOUR-MODEL-NAME",  # as the server names it
+  url = "http://localhost:11434/v1",  # the model's base URL, ending in /v1
+  model = "gemma4:12b-it-qat",  # as the server names it (`ollama list`)
   key = NULL,  # none at work; never type a key here (NULL reads STANCE_KEY)
+  reasoning_effort = "none",  # turns thinking off on Ollama; NULL if the server rejects it
   workers = 4L,  # requests sent to the model at once; 1 sends them one by one
   save_every = 200L)  # labels are saved after this many passages
 
@@ -34,7 +38,8 @@ suppressPackageStartupMessages({
 })
 theme_set(theme_minimal(base_size = 12))
 source(here::here("stance", "stance_source.R"))  # also sources R/stance_core.R
-ep <- stance_endpoint(st$url, st$model, st$key)
+ep <- stance_endpoint(st$url, st$model, st$key, st$reasoning_effort)
+sch <- stance_scheme(st$scheme)
 d0 <- stance_defaults
 dir.create(p_out(""), showWarnings = FALSE)
 ```
@@ -43,13 +48,13 @@ dir.create(p_out(""), showWarnings = FALSE)
 
 Every passage in the corpus is read by a language model and labeled for its stance toward one claim. Nothing is sampled, so there is no sampling error and no weights. What is left is the variation of the shares themselves and the error in the labels, and only the first of those is in the intervals below.
 
-1. **Coding.** Each passage goes to the model alone, in its own request, at temperature 0, without its date or its document. `st$workers` requests run at once; identical passages are sent once and the label copied to each. The model first decides whether the passage addresses the claim at all (otherwise *irrelevant*), then whether it favors the claim, opposes it, or is neutral.
-2. **Estimates.** Four quantities, because a share of all passages confounds two different things:
+1. **Coding.** Each passage goes to the model alone, in its own request, at temperature 0, without its date or its document. `st$workers` requests run at once; identical passages are sent once and the label copied to each. The prompt is built from the scheme in `st$scheme` (`r sch$name`). The model first decides whether the passage addresses the claim at all (otherwise *irrelevant*), then which label fits.
+2. **Estimates.** Salience plus one quantity per label, because a share of all passages confounds two different things:
 
 $$P(\text{favor}) = P(\text{addresses}) \times P(\text{favor} \mid \text{addresses})$$
 
 - **Salience** is the share of *all* passages that address the claim, that is $1 - P(\text{irrelevant})$. It says whether the claim is live in the corpus.
-- **Favor, neutral, oppose** are shares of the passages that *do* address it. They say which way those writers lean.
+- **The labels** (favor, neutral, oppose for the default) are shares of the passages that *do* address it. They say which way those writers lean.
 
 Reported together, the two separate a rise in agreement from a rise in attention; a single combined share cannot tell them apart. Multiplying them back together recovers a share of all passages. The cost is that the direction estimates rest on a smaller base that moves over time, so a period can hold plenty of passages and still hold too few that address the claim. Each basis therefore gets its own period set, and the report says what was dropped.
 
@@ -60,6 +65,8 @@ Each quantity is modeled as a smooth function of time (a logistic regression on 
 **Passage length.** Only passages between `r d0$min_words` and `r d0$max_words` words are coded. Below the floor there is not enough text to hold a position; above the ceiling the text is a document rather than a passage, holds several positions at once, and may run past the model's context. These bounds are a guard against the wrong unit of text. They are much wider than what has been tried, which is paragraphs of roughly 50 to 80 tokens.
 
 The app runs these same functions on a file a user uploads, so a claim submitted there is treated exactly as the one below.
+
+**Scheme:** `r sch$name`
 
 **Claim:** `r st$proposition`
 
@@ -82,13 +89,13 @@ if (any(!paras$keep))
 
 # Coding
 
-Labels are saved every `r st$save_every` passages, so an interrupted run resumes where it stopped. Changing the claim or the model refuses the saved labels and names the file to delete; changing the corpus file does the same.
+Labels are saved every `r st$save_every` passages, so an interrupted run resumes where it stopped. Changing the claim, the scheme, or the model refuses the saved labels and names the file to delete; changing the corpus file does the same.
 
 ```{r classify}
 #| results: asis
 labels_path <- p_out(str_c("stance_labels_", st$name, ".csv"))
 prompt_path <- p_out(str_c("stance_prompt_", st$name, ".txt"))
-prompt <- stance_prompt(st$proposition, st$text_kind)
+prompt <- stance_prompt(sch, st$proposition, st$text_kind)
 writeLines(c(prompt, "", str_c("MODEL ", ep$model)), prompt_path)
 check_inputs(labels_path, c(corpus_in, prompt_path))
 
@@ -104,7 +111,7 @@ chunks <- split(texts, ceiling(seq_along(texts) / st$save_every))
 done <- purrr::reduce(seq_along(chunks), function(done, i) {
   u <- chunks[[i]]
   offset <- (i - 1) * st$save_every
-  lab <- code_all(u, prompt, ep, st$workers,
+  lab <- code_all(u, prompt, ep, sch, st$workers,
                   on_step = function(j, n) utils::setTxtProgressBar(pb, offset + j))
   d <- dplyr::filter(todo, text %in% u)
   out <- dplyr::bind_rows(done, tibble(stance_row = d$stance_row,
@@ -143,26 +150,26 @@ withr::with_seed(2026L, coded |>
 
 ```{r overall}
 #| results: asis
-static <- stance_static(coded)
+static <- stance_static(coded, sch)
 static |>
   dplyr::select(quantity, basis, passages = n, share, lo, hi) |>
-  tbl_paged(caption = "The whole corpus, with 95 percent intervals clustered by document. Salience is out of all passages; the other three are out of the passages that address the claim.")
+  tbl_paged(caption = "The whole corpus, with 95 percent intervals clustered by document. Salience is out of all passages; the labels are out of the passages that address the claim.")
 ```
 
 ```{r static-plot}
 #| fig-height: 3
 #| fig-cap: "The whole corpus. Intervals are 95 percent and do not include error in the model's labels."
-stance_plot_static(static)
+stance_plot_static(static, sch)
 ```
 
 ```{r trends}
 #| results: asis
-trends <- if (nzchar(st$time_col)) stance_trends(coded) else NULL
+trends <- if (nzchar(st$time_col)) stance_trends(coded, sch) else NULL
 purrr::walk(attr(trends, "notes"), function(x) writeLines(str_c("**", x, "**\n")))
 counts <- list(total = nrow(paras), coded = nrow(coded),
                excluded = nrow(paras) - nrow(coded),
                documents = dplyr::n_distinct(coded$cluster))
-stance_record(stance_table(static, trends), st$proposition, prompt, ep, counts) |>
+stance_record(stance_table(static, trends), sch, st$proposition, prompt, ep, counts) |>
   readr::write_csv(p_out(str_c("stance_estimates_", st$name, ".csv")))
 if (!stance_has_trend(trends)) {
   writeLines("No trend: time is not in the configuration, or too few periods are dense enough. The static estimate above is the result.\n")
@@ -179,11 +186,13 @@ if (!stance_has_trend(trends)) {
 
 ```{r trend-plots}
 #| fig-height: 3
-#| fig-cap: "Salience: the share of all passages that address the claim. Then the three directions among the passages that do, on one shared scale because they are shares of the same passages and add to 100 percent. Points are the observed share in each period, sized by the passages behind it. Intervals are 95 percent, clustered by document, and do not include error in the model's labels."
+#| fig-cap:
+#|   - "Salience: the share of all passages that address the claim. Points are the observed share in each period, sized by the passages behind it. Intervals are 95 percent, clustered by document, and do not include error in the model's labels."
+#|   - "The labels among the passages that address the claim, on one scale because they are shares of the same passages and add to 100 percent. Points and intervals as in the salience figure."
 if (stance_has_trend(trends)) {
-  obs <- stance_observed(coded)
+  obs <- stance_observed(coded, sch)
   print(stance_plot_salience(trends, obs))
-  print(stance_plot_direction(trends, obs))
+  print(stance_plot_direction(trends, obs, sch))
 }
 ```
 
@@ -198,7 +207,7 @@ Two cautions. One coder is a weak standard, so for a decision that matters have 
 ```{r handcode-sheet}
 #| results: asis
 sheet <- p_out(str_c("stance_handcode_", st$name, ".csv"))
-readr::write_csv(stance_sheet(coded, st$proposition), sheet)
+readr::write_csv(stance_sheet(coded, sch, st$proposition), sheet)
 writeLines(glue::glue("Wrote {basename(sheet)}: 400 passages with a blank \\
   `hand_label` column and no model label. Code it, put it in stance/inputs, \\
   and name it in `st$hand_file` to see the comparison here."))
@@ -213,7 +222,7 @@ if (nzchar(st$hand_file)) {
     dplyr::filter(!is.na(hand_label), hand_label != "") |>
     dplyr::inner_join(dplyr::select(coded, stance_row, label, cluster),
                       by = "stance_row")
-  a <- stance_agreement(hand$hand_label, hand$label, hand$cluster)
+  a <- stance_agreement(hand$hand_label, hand$label, hand$cluster, sch)
   writeLines(glue::glue(
     "{a$n} passages from {a$documents} document(s). Agreement \\
     {sprintf('%.1f%%', 100 * a$agree)} (95% {sprintf('%.1f', 100 * a$agree_ci[1])} \\

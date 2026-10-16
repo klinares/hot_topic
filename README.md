@@ -67,7 +67,7 @@ The labels are names, not findings. The words and paragraphs are the evidence, a
 
 ### Coding
 
-Every passage is coded; nothing is sampled. Each passage goes alone to a local model at temperature 0, without its date or document, and is labeled **favor, neutral, oppose, or irrelevant** (does not address the claim). Identical passages are sent once and the label copied to each copy; each copy still counts in the estimates, so a form letter sent by 500 people counts 500 times. Only passages of 5 to 250 words are coded, to guard against the wrong unit of text.
+Every passage is coded; nothing is sampled. Each passage goes alone to a local model at temperature 0, without its date or document, and is labeled with one label from the chosen scheme, or **irrelevant** (does not address the claim). The default scheme is **favor, neutral, oppose**; **agree, neutral, disagree** and **aligned, neutral, misaligned** are options in the app and in `stance.qmd` (`scheme`). The prompt is built from the scheme, so each scheme has its own definitions and rules. Only favor/oppose-style stance has evidence behind it (Li and Conrad 2024); run the hand-coded check before relying on the other two, and delete saved labels when you change scheme. Identical passages are sent once and the label copied to each copy; each copy still counts in the estimates, so a form letter sent by 500 people counts 500 times. Only passages of 5 to 250 words are coded, to guard against the wrong unit of text.
 
 ### Estimating
 
@@ -76,7 +76,7 @@ A share of all passages confounds attention with agreement, so the estimate is s
 $$P(\text{favor}) = P(\text{addresses}) \times P(\text{favor} \mid \text{addresses})$$
 
 - **Salience** is the share of all passages that address the claim: is it live?
-- **Favor, neutral, oppose** are shares of the passages that do address it: which way?
+- **The labels** (favor, neutral, oppose in the default scheme) are shares of the passages that do address it: which way?
 
 Each is a logistic regression on a natural spline in time, with 95 percent intervals clustered by document. **A period needs at least 30 passages to enter a trend, and a trend needs at least 4 such periods**; otherwise the estimate is static. Time may be a year, `YYYY-MM`, or a date.
 

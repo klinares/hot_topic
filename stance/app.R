@@ -17,7 +17,9 @@ options(shiny.maxRequestSize = 500 * 1024^2)  # uploads up to 500 MB
 # reads STANCE_KEY from .Renviron instead.
 options(stance.url = "http://localhost:11434/v1",
         stance.model = "gemma4:12b-it-qat",   # exactly as `ollama list` prints it
-        stance.key = NULL)
+        stance.key = NULL,
+        # "none" turns thinking off on Ollama; NULL if the server rejects it
+        stance.reasoning_effort = "none")
 
 # Requests sent to the model at the same time. These are open connections to
 # the model server, not R cores: R waits while the server works. Set it to

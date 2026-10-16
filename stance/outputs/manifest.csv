@@ -1,0 +1,3 @@
+output,input,md5
+stance_labels_world_role.csv,comments_periods.csv,65da1069634742d39eee5375bde76a65
+stance_labels_world_role.csv,stance_prompt_world_role.txt,e481fd180fd6825c382143b4aef87f8b

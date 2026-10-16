@@ -31,12 +31,13 @@ stance_help_ui <- function() {
           tags$strong("Stance detection"), " measures where writers stand on a ",
           "claim. You give the tool a file of short passages and one sentence that ",
           "states a position; a language model reads every passage on its own and ",
-          "labels it as favoring the claim, opposing it, neutral, or not addressing it ",
-          "at all. Those labels become two kinds of estimate, each with a 95 percent ",
+          "labels it with one of the labels of the scheme you choose (favor, neutral, ",
+          "oppose, for the default), or as not addressing the claim at all. Those ",
+          "labels become two kinds of estimate, each with a 95 percent ",
           "interval: ", b_("salience"), ", the share of all passages that ",
-          "address the claim, and ", b_("direction"), ", the shares that ",
-          "favor, oppose, or stay neutral among the passages that do. When the ",
-          "passages are dated, both are traced over time."),
+          "address the claim, and ", b_("direction"), ", the shares of each label ",
+          "among the passages that do. When the passages are dated, both are traced ",
+          "over time."),
         tags$p(
           "It is needed because the alternatives do not scale or do not measure the ",
           "right thing. Coding tens of thousands of passages by hand is slow and ",
@@ -60,6 +61,7 @@ stance_help_ui <- function() {
       bslib::card(
         bslib::card_header("How it works"),
         stance_flowchart())),
+    stance_scheme_card(),
     bslib::layout_columns(
       col_widths = c(7, 5),
       bslib::card(
@@ -67,12 +69,14 @@ stance_help_ui <- function() {
         tags$ol(
           tags$li(tags$strong("Prepare a CSV"), " in the format below."),
           tags$li("On ", b_("Detect stance"), ": upload it, pick the columns, ",
-                  "write the claim, describe the passages in a few words, and run."),
+                  "choose what to measure, write the claim, ",
+                  "describe the passages in a few words, and run."),
           tags$li(tags$strong("Download all three files."), " Your file with a ",
                   tags$code("stance"), " column, the estimates, and a sheet of 400 ",
                   "passages drawn at random. Keep the first one: the check needs it."),
           tags$li("Code the sheet by hand, without looking at the model's labels, ",
-                  "which the sheet leaves out on purpose."),
+                  "which the sheet leaves out on purpose. Its choose_from column ",
+                  "lists the labels you may use."),
           tags$li("On ", b_("Check the labels"), ", any day later: upload the ",
                   "file with labels and the coded sheet. Both carry the same run id, ",
                   "which is how they are matched; the app remembers nothing between ",
@@ -140,6 +144,34 @@ stance_help_ui <- function() {
       tags$a(href = docs, target = "_blank", "Method report (PDF)")))
 }
 
+# ---- choosing what to measure ------------------------------------------------
+# Generated from stance_schemes, so a scheme added there appears here.
+
+stance_scheme_card <- function() {
+  one <- function(s) tags$tr(
+    tags$td(tags$strong(s$name)),
+    tags$td(tags$code(paste(s$labels, collapse = " / ")), " + ", tags$code("irrelevant")),
+    tags$td(s$use))
+  bslib::card(
+    bslib::card_header("Choosing what to measure"),
+    tags$p("Pick the scheme on ", b_("Detect stance"), ". The prompt the model ",
+           "receives is built from it, so the labels, their definitions, and the ",
+           "rules the model follows all change with the choice. The prompt is ",
+           "saved with the estimates."),
+    tags$table(class = "table table-sm small",
+      tags$thead(tags$tr(tags$th("Scheme"), tags$th("Labels"), tags$th("Use it for"))),
+      tags$tbody(purrr::map(unname(stance_schemes), one))),
+    tags$ul(class = "small",
+      tags$li(tags$strong("Check before relying on a scheme. "),
+              "Agree and aligned use the same design as favor with different words. ",
+              "How well models match people on them has not been checked here, so ",
+              "run the hand check first."),
+      tags$li(tags$strong("Changing the scheme changes the prompt. "),
+              "Labels saved under another scheme or wording are not comparable. In ",
+              "the report (stance.qmd), delete the saved labels file when you change ",
+              "scheme; the app starts fresh each run.")))
+}
+
 # ---- the flowchart -----------------------------------------------------------
 # Plain HTML boxes and arrows, so it needs no package and follows the theme.
 
@@ -161,10 +193,10 @@ stance_flowchart <- function() {
                      "aside and reported."),
     stance_flow_arrow(),
     stance_flow_step(3, "Label", "The model reads each passage alone, several at a ",
-                     "time: favor, neutral, oppose, or irrelevant. Identical passages ",
-                     "are sent once."),
+                     "time, with one of the labels of the chosen scheme or irrelevant. ",
+                     "Identical passages are sent once."),
     stance_flow_arrow(),
-    stance_flow_step(4, "Estimate", "Salience out of all passages; direction out of ",
+    stance_flow_step(4, "Estimate", "Salience out of all passages; each label out of ",
                      "those that address the claim. Clustered by document."),
     div(class = "sf-branch",
         div(class = "sf-leaf", tags$strong("Trend"), div(class = "small text-muted",
