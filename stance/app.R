@@ -21,7 +21,7 @@ options(hot_topic.logo = "office_logo.png",
 # none, and a key is never typed here. Where one is needed (at home), NULL
 # reads STANCE_KEY from .Renviron instead.
 options(stance.url = "http://localhost:11434/v1",
-        stance.model = "gemma4:12b-it-qat",   # exactly as `ollama list` prints it
+        stance.model = "gemma4:31b",   # exactly as `ollama list` prints it
         stance.key = NULL,
         # "none" turns thinking off on Ollama; NULL if the server rejects it
         stance.reasoning_effort = "none")
