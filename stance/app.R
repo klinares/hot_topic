@@ -29,7 +29,7 @@ options(stance.url = "http://localhost:11434/v1",
 # Requests sent to the model at the same time. These are open connections to
 # the model server, not R cores: R waits while the server works. Set it to
 # what the server can serve at once (4 at work); 1 sends them one by one.
-options(stance.workers = 4L)
+options(stance.workers = 1)
 
 # Seconds the server takes per passage, measured one at a time (about 6,000
 # in ten minutes at work). Only used for the time estimate shown before a run.
@@ -37,7 +37,8 @@ options(stance.sec_per_passage = 0.1)
 
 # Other deployment settings, set here if needed:
 #   options(drsvyr.classification = "YOUR MARKING")   the banner on every page
-#   options(stance.tested = "...")   what the endpoint has been run on
+#   options(stance.tested = c("...", "..."))   what it has been run on, one
+#                                              line each (shown with the prompt)
 #   options(stance.docs = "...")     where the method report lives
 
 purrr::walk(list.files("R", pattern = "\\.R$", full.names = TRUE), source)

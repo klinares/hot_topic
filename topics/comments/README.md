@@ -26,15 +26,15 @@ Re-render both scripts before redeploying. The app checks that the codebook and 
 
 | Tab | What it shows |
 |---|---|
-| **Start here** | What topic modeling is and why it is used, how the results were made, how to read the numbers, a summary of the data, and links to the PDFs in `reports/`. |
+| **Start here** | What topic modeling is and why it is used, how the results were made, how to read the numbers, the prompt that drafted the labels (from `codebook_prompt.txt`) with why it is written that way and what it has been run on, a summary of the data, and links to the PDFs in `reports/`. |
 | **Topics** | One topic's words, label, description and draft claim, its share over time with a 95 percent interval, exact yearly counts, and every topic side by side. |
 | **Read** | The paragraphs behind a topic, filtered by topic, years, share or a word; click one to open the whole comment. CSV downloads. |
 
-Settings sit in one block at the top of `app.R`: the classification marking, the logo file name in `logo/`, an office name, what the text is, what one document is called, and the stance app's URL.
+Settings sit in one block at the top of `app.R`: the classification marking, the logo file name in `logo/`, an office name, what the text is, what one document is called, and the stance app's URL. `options(hot_topic.prompt_tested = c(...))` replaces the lines under "What it has been run on", one per test.
 
 ## Deploying on Posit Connect
 
-Publish `app.R`, `R/`, `reports/`, `logo/`, and from `outputs/` only `paragraph_theta.csv`, `topic_codebook.csv`, `topic_summary.csv`, `topic_trends.csv`. Uncheck the `.qmd` files, `inputs/`, `stm_fit.rds`, `embeddings.parquet`, and the other outputs; the app reads none of them.
+Publish `app.R`, `R/`, `reports/`, `logo/`, and from `outputs/` only `paragraph_theta.csv`, `topic_codebook.csv`, `topic_summary.csv`, `topic_trends.csv`, and `codebook_prompt.txt`. Uncheck the `.qmd` files, `inputs/`, `stm_fit.rds`, `embeddings.parquet`, and the other outputs; the app reads none of them.
 
 `paragraph_theta.csv` holds the text of every paragraph. Publish or commit it only where that text may be stored.
 

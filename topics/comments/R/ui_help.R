@@ -107,6 +107,7 @@ help_ui <- function(hd) {
           tags$li(tags$strong("Attention, not opinion."), " A rising topic means more ",
                   "is written about it, not that more people favor it. That is what ",
                   "the stance tool measures.")))),
+    help_prompt_card(hd),
     bslib::card(
       bslib::card_header("The data in this deployment"),
       bslib::layout_columns(
@@ -198,6 +199,69 @@ help_css <- function() tags$style(HTML("
   background: var(--bs-primary); color: #fff; font-size: .8rem; font-weight: 600;
   display: flex; align-items: center; justify-content: center; margin-top: .1rem; }
 .tf-later .tf-num { background: var(--bs-secondary); }
+.tf-pre { white-space: pre-wrap; background: var(--bs-tertiary-bg);
+  padding: .75rem; border-radius: .375rem; }
 .tf-arrow { text-align: center; color: var(--bs-secondary-color); line-height: 1.1;
   font-size: 1.1rem; }
 "))
+
+# ---- the codebook prompt -----------------------------------------------------
+# The prompt that drafted the labels, as topics.qmd saved it, then why it is
+# written this way and what it has been run on.
+#   options(hot_topic.prompt_tested = c("...", "..."))  one line per test,
+#                                                        replacing the defaults
+
+help_tested_default <- c(
+  paste("Drafted the label, description and proposition for each of the 12 topics",
+        "of the demonstration corpus, 60 presidential inaugural addresses."),
+  paste("Not measured: how often a draft is right. Read each one against its",
+        "topic's words (Topics) and paragraphs (Read) before using it, and edit",
+        "topic_codebook.csv where it is wrong; edits are never overwritten."))
+
+help_prompt_card <- function(hd) {
+  tested <- getOption("hot_topic.prompt_tested", help_tested_default)
+  shown <- if (is.null(hd$prompt))
+    tags$p(class = "small text-danger",
+           "codebook_prompt.txt is not in outputs/. Render topics.qmd to write it.") else
+    tags$pre(class = "small mb-0 tf-pre", paste(hd$prompt, collapse = "\n"))
+  bslib::card(
+    bslib::card_header("The prompt behind the labels"),
+    bslib::layout_columns(
+      col_widths = c(7, 5),
+      tags$div(
+        tags$p(class = "small",
+               "The topics are found by the statistical model; no language model ",
+               "touches that step. A language model only drafts the words a person ",
+               "reads: each topic's label, description, and proposition. It gets ",
+               "one request per topic, with the system message below and that ",
+               "topic's evidence as the user message."),
+        shown),
+      tags$div(
+        tags$h6("Why it is written this way"),
+        tags$ul(class = "small",
+          tags$li(tags$strong("One topic at a time. "),
+                  "Each request sees one topic's evidence and nothing about the others, ",
+                  "so a label describes that topic rather than how it differs from a ",
+                  "neighbor the model happened to see."),
+          tags$li(tags$strong("Two kinds of words, and real paragraphs. "),
+                  "FREX words are frequent in the topic and rare elsewhere; probable ",
+                  "words are simply common in it. The paragraphs are those most ",
+                  "strongly in the topic, so the model sees the text, not only a word ",
+                  "list."),
+          tags$li(tags$strong("Only the evidence shown. "),
+                  "No outside knowledge, no guessing who is speaking, no invented ",
+                  "facts, and mixed evidence said plainly, so a label cannot claim more ",
+                  "than the topic holds."),
+          tags$li(tags$strong("A proposition with one side. "),
+                  "Written as a claim a paragraph can agree or disagree with, never ",
+                  "“X rather than Y”, so it can go straight to the stance tool."),
+          tags$li(tags$strong("Short, fixed form. "),
+                  "At most four words, one sentence, one claim, returned as fields ",
+                  "rather than prose, at temperature 0, so the drafts are consistent ",
+                  "and easy to edit."),
+          tags$li(tags$strong("Drafted once. "),
+                  "The codebook is never redrafted while it exists, so a person's ",
+                  "edits stand.")),
+        tags$h6("What it has been run on"),
+        tags$ul(class = "small mb-0", purrr::map(tested, tags$li)))))
+}

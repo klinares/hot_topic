@@ -39,7 +39,11 @@ load_outputs <- function(dir) {
   paras <- paras |>
     dplyr::left_join(dplyr::select(topics, topic, label), by = "topic") |>
     dplyr::arrange(id, para_id)
-  list(paras = paras, topics = topics, trends = tr, years = range(paras$Year))
+  # the codebook prompt, saved by topics.qmd; optional, so an older render works
+  pf <- file.path(dir, "codebook_prompt.txt")
+  prompt <- if (file.exists(pf)) readLines(pf, warn = FALSE) else NULL
+  list(paras = paras, topics = topics, trends = tr, years = range(paras$Year),
+       prompt = prompt)
 }
 
 topic_choices <- function(topics)

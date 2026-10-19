@@ -195,7 +195,7 @@ One call per topic, in parallel, with the larger model. Each call sees only that
 #| results: asis
 codebook <- draft_codebook(p_out("topic_codebook.csv"), theta_out, tables,
                            "speeches in the general debate of the UN General Assembly",
-                           tx$steps, tx$use_openrouter, tx$n_examples)
+                           tx$steps, tx$use_openrouter, tx$n_examples, tx$n_words)
 dup <- codebook |> dplyr::add_count(label) |> dplyr::filter(n > 1, !is.na(label))
 if (nrow(dup)) writeLines(glue::glue("**Duplicate labels to fix:** \\
   {str_c('topic ', dup$topic, ' (', dup$label, ')', collapse = ', ')}."))

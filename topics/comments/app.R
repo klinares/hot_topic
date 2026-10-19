@@ -3,7 +3,8 @@
 # in this same folder, so nothing is copied. It never refits or calls a model.
 #
 # On Posit Connect, publish app.R, R/, reports/, logo/, and from outputs/ only
-# paragraph_theta.csv, topic_codebook.csv, topic_summary.csv, topic_trends.csv.
+# paragraph_theta.csv, topic_codebook.csv, topic_summary.csv, topic_trends.csv,
+# and codebook_prompt.txt (shown on Start here; optional).
 
 library(shiny)
 options(bitmapType = "cairo")  # the work server has no X11

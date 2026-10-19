@@ -141,12 +141,12 @@ if (isTRUE(tx$run_sensitivity)) {
 
 # Topic codebook
 
-One call per topic, in parallel, with the larger model. Each call sees only that topic's `r tx$n_words` most distinctive (FREX) and most probable words and its `r tx$n_examples` most typical paragraphs. It drafts a label, a one-sentence description, and a proposition for the stance app. If `topic_codebook.csv` exists it is read, not redrafted, so your edits survive. Delete it to redraft.
+One call per topic, in parallel, with the larger model. Each call sees only that topic's `r tx$n_words` most distinctive (FREX) and most probable words and its `r tx$n_examples` most typical paragraphs. It drafts a label, a one-sentence description, and a proposition for the stance app. If `topic_codebook.csv` exists it is read, not redrafted, so your edits survive. Delete it to redraft. The prompt is saved as `codebook_prompt.txt`, which the app shows on its Start here page.
 
 ```{r codebook}
 #| results: asis
 codebook <- draft_codebook(p_out("topic_codebook.csv"), theta_in, tables, "public comments",
-                           tx$steps, tx$use_openrouter, tx$n_examples)
+                           tx$steps, tx$use_openrouter, tx$n_examples, tx$n_words)
 dup <- codebook |> dplyr::add_count(label) |> dplyr::filter(n > 1, !is.na(label))
 if (nrow(dup)) writeLines(glue::glue("**Duplicate labels to fix:** \\
   {str_c('topic ', dup$topic, ' (', dup$label, ')', collapse = ', ')}."))
@@ -178,5 +178,5 @@ trends |>
 ```{r handoff}
 #| results: asis
 writeLines(glue::glue("Wrote paragraph_theta.csv, topic_summary.csv, topic_codebook.csv, \\
-  topic_trends.csv and stm_fit.rds to topics/comments/outputs/."))
+  codebook_prompt.txt, topic_trends.csv and stm_fit.rds to topics/comments/outputs/."))
 ```

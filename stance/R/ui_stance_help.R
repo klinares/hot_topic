@@ -3,7 +3,7 @@
 # write a claim the model can code well.
 #
 # Deployment settings this page reads (set in app.R):
-#   options(stance.tested = "...")   what the endpoint has been run on
+#   options(stance.tested = c(...))   what it has been run on (the prompt card)
 #   options(stance.docs = "...")     where the method report lives
 
 li_conrad <- tags$a(
@@ -17,9 +17,6 @@ stance_help_ui <- function() {
   ep <- tryCatch(stance_endpoint(), error = function(e) list(model = NULL, url = NULL))
   docs <- getOption("stance.docs",
                     "https://github.com/klinares/hot_topic/blob/main/stance/stance.pdf")
-  tested <- getOption("stance.tested", paste(
-    "English paragraphs from public comments, about 50 to 80 tokens each;",
-    "about 6,000 of them took ten minutes one at a time."))
   d <- stance_defaults
   tagList(
     stance_flow_css(),
@@ -62,6 +59,7 @@ stance_help_ui <- function() {
         bslib::card_header("How it works"),
         stance_flowchart())),
     stance_scheme_card(),
+    stance_prompt_card(),
     bslib::layout_columns(
       col_widths = c(7, 5),
       bslib::card(
@@ -140,7 +138,7 @@ stance_help_ui <- function() {
       if (is.null(ep$model)) tags$span(class = "text-danger",
         "not configured; set stance.url and stance.model in app.R.") else
         tagList(tags$code(ep$model), " at ", tags$code(ep$url)),
-      tags$br(), tags$strong("Tried on: "), tested, " ",
+      tags$br(),
       tags$a(href = docs, target = "_blank", "Method report (PDF)")))
 }
 

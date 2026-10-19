@@ -360,16 +360,11 @@ match_topics <- function(b_ref, b_alt) {
 # that topic's words and its most typical paragraphs (`text` must be in
 # paragraph_theta). Written once: an existing file is read, never redrafted,
 # so hand edits survive.
-draft_codebook <- function(path, inputs, tables, source_desc, steps, home, n_examples) {
-  check_inputs(path, inputs)
-  if (file.exists(path)) return(readr::read_csv(path, show_col_types = FALSE))
-  ev <- tables$paragraph_theta |>
-    dplyr::group_by(topic) |>
-    dplyr::slice_max(theta_max, n = n_examples, with_ties = FALSE) |>
-    dplyr::summarise(ex = str_c("- ", str_trunc(text, 400), collapse = "\n")) |>
-    dplyr::right_join(tables$topic_summary, by = "topic") |>
-    dplyr::arrange(topic)
-  sys <- build_prompt(
+# The codebook prompt: the system message, and the shape of the one user
+# message each topic gets. One function, so the drafting and the copy saved for
+# the app cannot differ.
+codebook_prompt <- function(source_desc, n_words = 20L, n_examples = 5L) list(
+  system = build_prompt(
     role = "You are a survey methodologist who names statistical topics so colleagues can use them.",
     task = str_c("Read one topic's words and example paragraphs from ", source_desc, ". Write a ",
                  "short label, one factual sentence on what the paragraphs discuss, and one ",
@@ -380,7 +375,46 @@ draft_codebook <- function(path, inputs, tables, source_desc, steps, home, n_exa
               "Do not invent statistics, dates, places, or names.",
               "The proposition states one side only: never 'X over Y' or 'X rather than Y'.",
               "If the evidence is mixed, say so plainly."),
-    output = "A label of at most 4 words, a one-sentence description, and a one-sentence proposition.")
+    output = "A label of at most 4 words, a one-sentence description, and a one-sentence proposition."),
+  user = str_c("Distinctive words: <the topic's ", n_words, " FREX words>\n",
+               "Most probable words: <its ", n_words, " most probable words>\n",
+               "Example paragraphs:\n",
+               "- <one of its ", n_examples, " most typical paragraphs, up to 400 characters>\n",
+               "- ..."))
+
+# The prompt as the app shows it, saved beside the codebook as
+# codebook_prompt.txt. Written when the codebook is drafted, and when it is
+# missing, so an existing codebook gains one without being redrafted.
+write_codebook_prompt <- function(path, source_desc, steps, home, n_words, n_examples,
+                                  drafted = FALSE) {
+  f <- file.path(dirname(path), "codebook_prompt.txt")
+  if (!drafted && file.exists(f)) return(invisible(f))
+  pr <- codebook_prompt(source_desc, n_words, n_examples)
+  model <- if (isTRUE(home)) unname(open_router_models[["codebook"]]) else
+    steps$model[steps$step == "codebook"]
+  # an existing codebook was drafted before this file: its model is not known
+  model_line <- if (drafted) str_c("MODEL ", model) else
+    str_c("MODEL not recorded (the codebook predates this file; configured now: ", model, ")")
+  writeLines(c("SYSTEM MESSAGE", "", pr$system, "", "USER MESSAGE, one per topic", "",
+               pr$user, "", model_line, "TEMPERATURE 0",
+               str_c("WRITTEN ", format(Sys.Date()))), f)
+  invisible(f)
+}
+
+draft_codebook <- function(path, inputs, tables, source_desc, steps, home, n_examples,
+                           n_words = 20L) {
+  check_inputs(path, inputs)
+  if (file.exists(path)) {
+    write_codebook_prompt(path, source_desc, steps, home, n_words, n_examples)
+    return(readr::read_csv(path, show_col_types = FALSE))
+  }
+  ev <- tables$paragraph_theta |>
+    dplyr::group_by(topic) |>
+    dplyr::slice_max(theta_max, n = n_examples, with_ties = FALSE) |>
+    dplyr::summarise(ex = str_c("- ", str_trunc(text, 400), collapse = "\n")) |>
+    dplyr::right_join(tables$topic_summary, by = "topic") |>
+    dplyr::arrange(topic)
+  sys <- codebook_prompt(source_desc, n_words, n_examples)$system
   type <- ellmer::type_object(
     label = ellmer::type_string("At most 4 words."),
     description = ellmer::type_string("One factual sentence."),
@@ -394,6 +428,7 @@ draft_codebook <- function(path, inputs, tables, source_desc, steps, home, n_exa
                                dplyr::select(drafts, label, description, proposition))
   readr::write_csv(codebook, path, na = "")
   record_inputs(path, inputs)
+  write_codebook_prompt(path, source_desc, steps, home, n_words, n_examples, drafted = TRUE)
   if (anyNA(codebook$label))
     warning(sum(is.na(codebook$label)), " topics got no label; name them by hand.")
   codebook

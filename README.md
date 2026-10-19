@@ -58,6 +58,7 @@ STM returns topics as word lists. A larger language model drafts a name for each
 - The prompt has a fixed shape (role, task, rules, output) and forbids inferring who is speaking, inventing names, dates or statistics, or smoothing over mixed evidence.
 - It returns a **label** (at most 4 words), a **one-sentence description**, and a **proposition**: a single one-sided claim a paragraph on this topic could agree or disagree with. The proposition is the bridge to stance detection.
 - The codebook is **drafted once**. If `topic_codebook.csv` exists it is read, never redrafted, so a person's edits survive. Duplicate labels are flagged.
+- The prompt is saved beside the codebook as `codebook_prompt.txt`, and the dashboard prints it on **Start here** with why it is written that way and what it has been run on.
 
 The labels are names, not findings. The words and paragraphs are the evidence, and a person checks every label against them.
 
@@ -67,7 +68,7 @@ The labels are names, not findings. The words and paragraphs are the evidence, a
 
 ### Coding
 
-Every passage is coded; nothing is sampled. Each passage goes alone to a local model at temperature 0, without its date or document, and is labeled with one label from the chosen scheme, or **irrelevant** (does not address the claim). The default scheme is **favor, neutral, oppose**; **agree, neutral, disagree** and **aligned, neutral, misaligned** are options in the app and in `stance.qmd` (`scheme`). The prompt is built from the scheme, so each scheme has its own definitions and rules. Only favor/oppose-style stance has evidence behind it (Li and Conrad 2024); run the hand-coded check before relying on the other two, and delete saved labels when you change scheme. Identical passages are sent once and the label copied to each copy; each copy still counts in the estimates, so a form letter sent by 500 people counts 500 times. Only passages of 5 to 250 words are coded, to guard against the wrong unit of text.
+Every passage is coded; nothing is sampled. Each passage goes alone to a local model at temperature 0, without its date or document, and is labeled with one label from the chosen scheme, or **irrelevant** (does not address the claim). The default scheme is **favor, neutral, oppose**; **agree, neutral, disagree** and **aligned, neutral, misaligned** are options in the app and in `stance.qmd` (`scheme`). The prompt is built from the scheme, so each scheme has its own definitions and rules. Only favor/oppose-style stance has evidence behind it (Li and Conrad 2024); run the hand-coded check before relying on the other two, and delete saved labels when you change scheme. Identical passages are sent once and the label copied to each copy; each copy still counts in the estimates, so a form letter sent by 500 people counts 500 times. Only passages of 5 to 250 words are coded, to guard against the wrong unit of text. The app's **Start here** page prints the prompt for each scheme, built by the same function a run uses, with why each part is there and what it has been run on (`options(stance.tested = c(...))` in `app.R` replaces those lines).
 
 ### Estimating
 
