@@ -68,7 +68,7 @@ The labels are names, not findings. The words and paragraphs are the evidence, a
 
 ### Coding
 
-Every passage is coded; nothing is sampled. Each passage goes alone to a local model at temperature 0, without its date or document, and is labeled with one label from the chosen scheme, or **irrelevant** (does not address the claim). The default scheme is **favor, neutral, oppose**; **agree, neutral, disagree** and **aligned, neutral, misaligned** are options in the app and in `stance.qmd` (`scheme`). The prompt is built from the scheme, so each scheme has its own definitions and rules. Only favor/oppose-style stance has evidence behind it (Li and Conrad 2024); run the hand-coded check before relying on the other two, and delete saved labels when you change scheme. Identical passages are sent once and the label copied to each copy; each copy still counts in the estimates, so a form letter sent by 500 people counts 500 times. Only passages of 5 to 250 words are coded, to guard against the wrong unit of text. The app's **Start here** page prints the prompt for each scheme, built by the same function a run uses, with why each part is there and what it has been run on (`options(stance.tested = c(...))` in `app.R` replaces those lines).
+Every passage is coded; nothing is sampled. Each passage goes alone to the model, without its date or document, at the model's default sampling (Claude Opus takes no temperature setting), and is labeled with one label from the chosen scheme, or **irrelevant** (does not address the claim). The default scheme is **favor, neutral, oppose**; **agree, neutral, disagree** and **aligned, neutral, misaligned** are options in the app and in `stance.qmd` (`scheme`). The prompt is built from the scheme, so each scheme has its own definitions and rules. Only favor/oppose-style stance has evidence behind it (Li and Conrad 2024); run the hand-coded check before relying on the other two, and delete saved labels when you change scheme. Identical passages are sent once and the label copied to each copy; each copy still counts in the estimates, so a form letter sent by 500 people counts 500 times. Only passages of 5 to 250 words are coded, to guard against the wrong unit of text. The app's **Start here** page prints the prompt for each scheme, built by the same function a run uses, how the model is called, why each part is there, and what it has been run on.
 
 ### Estimating
 
@@ -106,23 +106,21 @@ COMPASS_LARGE_URL / COMPASS_LARGE_KEY   topic labels
 
 At home, set `use_openrouter = TRUE` in each topics script; models then come from `topics/llm_openrouter.R` and the key from `OPENROUTER_API_KEY`. At work set it to `FALSE`.
 
-Stance needs no key at work. Set `stance.url` and `stance.model` as strings in `stance/app.R` (and `url`, `model` in `stance.qmd`) and leave the key `NULL`. At home, set them to `NULL` so they come from `.Renviron` in the repo root:
+**The stance app** sends every passage to Claude Opus through `ellmer`. The base URL and model ID are set in `stance/app.R` (`stance.base_url`, `stance.model`); paste them there, and the app will not start while a placeholder is left. The user pastes their own API key (**Use this key**; **Forget it** drops it) and presses **Check connection**: one short request through the same path a run uses. A run stays locked until the check passes, and a new key locks it again. The error shown names the problem (bad key, unknown model, unreachable host, an empty reply), never the key. There is no server key: the app reads no environment variable, sets none, and writes the key into no file. Opus takes no temperature setting, so requests go at its default sampling with thinking off. Requests go 4 at a time (`stance.workers`), and a run waits so no minute holds more than 300 (`stance.rpm`). Labels from Opus have not yet been checked against hand coding; do the 400-passage check before reporting them. The banner (UNCLASSIFIED) and the logo (`logo/office_logo.png`) are set in `app.R` itself.
+
+**`stance.qmd`** takes the base URL and model ID in its config (`url`, `model`) and the key from `STANCE_KEY` in `.Renviron` in the repo root, never from the script:
 
 ```
-OPENROUTER_API_KEY=sk-or-v1-...
-STANCE_URL=https://openrouter.ai/api/v1
-STANCE_MODEL=google/gemma-4-31b-it
-STANCE_KEY=${OPENROUTER_API_KEY}
+STANCE_KEY=sk-ant-...
 ```
-
-For a local Ollama model, use `STANCE_URL=http://localhost:11434/v1`, the tag `ollama list` shows as `STANCE_MODEL`, and leave `STANCE_KEY` empty.
 
 On Posit Connect, plots use Cairo (`options(bitmapType = "cairo")`) since the server has no X11. For the stance app, set **Max connections per process** to 1: a run holds its R process while it codes.
 
 ## Packages
 
 Topics scripts: tidyverse, here, viridis, stm, tidytext, splines, furrr, clue, withr, httr2, cli, ellmer (0.4 or later), knitr, glue, arrow.
-Stance: shiny, bslib, ggplot2, dplyr, purrr, readr, tibble, withr, splines, httr2 (1.1.1 or later).
+Stance: shiny, bslib, ggplot2, dplyr, purrr, readr, tibble, withr, splines, httr2, ellmer (0.4.0 or later, for `credentials`; built and tested with 0.4.2).
+Stance tests: testthat and webfakes. Run `testthat::test_dir("stance/tests/testthat")`; the tests use local mock servers, so no network and no real key.
 
 ## Troubleshooting
 
@@ -134,7 +132,9 @@ Stance: shiny, bslib, ggplot2, dplyr, purrr, readr, tibble, withr, splines, httr
 | `stm_fit.rds has K = a but tx$K = b` | delete `stm_fit.rds` |
 | `sensitivity.parquet was built at another K` | delete `sensitivity.parquet` |
 | `Set X and Y in .Renviron` | the setting is empty; set it, then restart R |
-| `The model could not be reached or did not answer` | check `stance.url` and `stance.model`, and that the server can reach the endpoint |
+| `No answer from <model> at <url>: ...` | the provider's own message follows: a 401 is the key, a 404 usually the model name or the URL; fix it and check the connection again |
+| `Paste the base URL and model ID into app.R` | `stance.base_url` or `stance.model` is still a placeholder |
+| stance app: `N passage(s) got no label` | each reason is listed; the labeled file's `stance_excluded` column gives it per row |
 | `N passages got no label; re-render to retry them` | the successes are saved; re-render sends only the rest |
 | stance: `X: no trend, N period(s) with at least 30 passages` | not enough dense periods; read the static estimate |
 | check: `The two files come from different runs` | download the labeled file and the sheet from the same run |

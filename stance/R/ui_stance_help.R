@@ -1,10 +1,6 @@
 # ui_stance_help.R: the Start here page. What the method is and why, how to
 # use the tool and shape a file for it, a picture of the steps, and how to
 # write a claim the model can code well.
-#
-# Deployment settings this page reads (set in app.R):
-#   options(stance.tested = c(...))   what it has been run on (the prompt card)
-#   options(stance.docs = "...")     where the method report lives
 
 li_conrad <- tags$a(
   href = "https://arxiv.org/abs/2406.07483", target = "_blank",
@@ -14,9 +10,6 @@ li_conrad <- tags$a(
 b_ <- function(x) tags$strong(x, .noWS = "after")
 
 stance_help_ui <- function() {
-  ep <- tryCatch(stance_endpoint(), error = function(e) list(model = NULL, url = NULL))
-  docs <- getOption("stance.docs",
-                    "https://github.com/klinares/hot_topic/blob/main/stance/stance.pdf")
   d <- stance_defaults
   tagList(
     stance_flow_css(),
@@ -66,7 +59,11 @@ stance_help_ui <- function() {
         bslib::card_header("Using the tool"),
         tags$ol(
           tags$li(tags$strong("Prepare a CSV"), " in the format below."),
-          tags$li("On ", b_("Detect stance"), ": upload it, pick the columns, ",
+          tags$li("On ", b_("Detect stance"), ": paste your API key, ",
+                  "press ", b_("Use this key"), ", then ", b_("Check connection"),
+                  ". A run stays locked until the check passes. The key stays in your ",
+                  "session only; it is not saved or written into any file."),
+          tags$li("Upload the CSV, pick the columns, ",
                   "choose what to measure, write the claim, ",
                   "describe the passages in a few words, and run."),
           tags$li(tags$strong("Download all three files."), " Your file with a ",
@@ -102,8 +99,8 @@ stance_help_ui <- function() {
                   "makes the intervals too narrow. Leave it blank only when every row ",
                   "really is a separate writer.")),
         tags$p(class = "small text-muted",
-               "Every passage is sent to the model named below. Upload only text you ",
-               "are permitted to send there.")),
+               "Every passage is sent to Anthropic. Upload only text you are permitted ",
+               "to send there.")),
       bslib::card(
         class = "border-primary",
         bslib::card_header(class = "bg-primary text-white", "Writing a good claim"),
@@ -134,12 +131,8 @@ stance_help_ui <- function() {
                        "comparative analysis of large language models and crowd ",
                        "sourcing", .noWS = "after"), ", arXiv:2406.07483."))),
     tags$p(class = "small text-muted mt-2",
-      tags$strong("Model: "),
-      if (is.null(ep$model)) tags$span(class = "text-danger",
-        "not configured; set stance.url and stance.model in app.R.") else
-        tagList(tags$code(ep$model), " at ", tags$code(ep$url)),
-      tags$br(),
-      tags$a(href = docs, target = "_blank", "Method report (PDF)")))
+      tags$a(href = "https://github.com/klinares/hot_topic/blob/main/stance/stance.pdf",
+             target = "_blank", "Method report (PDF)")))
 }
 
 # ---- choosing what to measure ------------------------------------------------

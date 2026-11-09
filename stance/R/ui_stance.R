@@ -12,6 +12,12 @@
 # "Max connections per process" to 1 so one user's run never freezes another
 # user's session. options(stance.workers = n) in app.R sets how many requests
 # go to the model at once.
+#
+# The model and its URL are fixed in app.R; the user pastes a key. The key is
+# held in a reactiveVal of this module, so it belongs to one
+# session and goes when the session ends: never written to disk, never in a
+# download, never set with Sys.setenv(), which would expose it to other
+# sessions, and no key is ever read from the server's environment.
 
 stance_examples <- c(
   "The proposed rule should be withdrawn.",
@@ -25,11 +31,22 @@ mod_stance_ui <- function(id) {
   bslib::layout_sidebar(
     sidebar = bslib::sidebar(
       width = 400,
-      tags$h5("1. Your passages"),
+      tags$h5("1. Connect to the model"),
+      tags$p(class = "small mb-1", "Model: ", tags$code(getOption("stance.model"))),
+      passwordInput(ns("key"), "API key", width = "100%", placeholder = "Paste your key"),
+      tags$div(class = "d-flex gap-2 mb-2",
+               actionButton(ns("use_key"), "Use this key", class = "btn-primary"),
+               actionButton(ns("forget_key"), "Forget it")),
+      uiOutput(ns("key_status")),
+      tags$p(class = "small text-muted",
+             "The key lives in this session only. It is never saved and is not in any result."),
+      actionButton(ns("connect"), "Check connection", class = "btn-outline-primary w-100"),
+      uiOutput(ns("conn")),
+      tags$h5("2. Your passages"),
       fileInput(ns("file"), NULL, accept = c(".csv", "text/csv"),
                 buttonLabel = "CSV file", placeholder = "no file"),
       uiOutput(ns("cols")),
-      tags$h5("2. What to measure"),
+      tags$h5("3. What to measure"),
       selectInput(ns("scheme"), NULL, width = "100%",
                   choices = purrr::map_chr(stance_schemes, "name") |>
                     (function(x) stats::setNames(names(x), x))()),
@@ -46,11 +63,11 @@ mod_stance_ui <- function(id) {
              "Goes into the prompt, so write it as a description: ",
              tags$em("paragraphs from public comments"), ", ",
              tags$em("answers to an open-ended survey question"), "."),
-      tags$h5("3. Run"),
+      tags$h5("4. Run"),
       uiOutput(ns("ready")),
       actionButton(ns("go"), "Detect stance", class = "btn-primary w-100"),
       tags$hr(),
-      tags$h5("4. Download"),
+      tags$h5("5. Download"),
       downloadButton(ns("dl_data"), "Your file with labels (CSV)",
                      class = "btn-outline-secondary w-100 mb-2"),
       downloadButton(ns("dl_est"), "Estimates (CSV)",
@@ -129,7 +146,52 @@ mod_stance_server <- function(id) {
   moduleServer(id, function(input, output, session) {
     d0 <- stance_defaults
     workers <- max(1L, as.integer(getOption("stance.workers", 1L)))
-    sec_each <- getOption("stance.sec_per_passage", 0.1)
+
+    # ---- the key and the connection ------------------------------------------
+    # key() is the pasted key, conn() the endpoint once a check has passed. A new
+    # or forgotten key clears conn(), so a run never uses a key that was not
+    # checked.
+    key <- reactiveVal(NULL)
+    conn <- reactiveVal(NULL)
+    conn_msg <- reactiveVal(NULL)
+    disconnect <- function() {
+      conn(NULL)
+      conn_msg(NULL)
+    }
+    observeEvent(input$use_key, {
+      k <- trimws(input$key %||% "")
+      updateTextInput(session, "key", value = "")
+      if (!nzchar(k)) return(showNotification("Nothing pasted.", type = "warning"))
+      key(k)
+      disconnect()
+    })
+    observeEvent(input$forget_key, {
+      key(NULL)
+      disconnect()
+    })
+    output$key_status <- renderUI(
+      if (is.null(key())) tags$p(class = "small text-warning mb-1", "No key in use.") else
+        tags$p(class = "small text-success mb-1", "✓ Key in use for this session."))
+
+    observeEvent(input$connect, {
+      if (is.null(key()))
+        return(conn_msg(list(ok = FALSE, message = "Paste your API key and press Use this key first.")))
+      ep <- stance_endpoint(key())
+      res <- withProgress(message = "Checking the model", value = 0.5, stance_check(ep))
+      conn(if (res$ok) ep)
+      conn_msg(res)
+    })
+    output$conn <- renderUI({
+      m <- conn_msg()
+      tagList(
+        if (is.null(m)) tags$p(class = "small text-muted mt-2", "Check the connection before a run.") else
+          tags$p(class = paste("small mt-2", if (m$ok) "text-success" else "text-danger"), m$message),
+        tags$p(class = "small text-warning",
+          "Labels from this model have not yet been checked against hand coding, so do ",
+          "the 400-passage check before reporting. Your passages go to ",
+          httr2::url_parse(getOption("stance.base_url"))$hostname,
+          ": upload only text that may go there."))
+    })
 
     purrr::iwalk(stance_examples, function(x, i)
       observeEvent(input[[paste0("ex", i)]], updateTextAreaInput(session, "prop", value = x)))
@@ -233,12 +295,18 @@ mod_stance_server <- function(id) {
       if (n == 0) return(tags$p(class = "small text-danger",
                                 "No row is within the word bounds."))
       n_u <- dplyr::n_distinct(p$text[p$keep])  # duplicates are sent once
-      # one request per passage, `workers` at a time; the estimate assumes the
-      # server keeps up, which it may not
-      tags$p(class = "small text-muted", sprintf(
-        "%s passages, %s unique, one request each, %d at a time: about %s. Keep this tab open.",
-        format(n, big.mark = ","), format(n_u, big.mark = ","), workers,
-        fmt_dur(n_u * sec_each / workers)))
+      # Time from the check's reply time, `workers` at a time, but never faster
+      # than the per-minute limit, which the run waits for.
+      secs <- conn_msg()$secs
+      if (!is.null(secs))
+        secs <- max(n_u * secs / workers, n_u / getOption("stance.rpm", 300) * 60)
+      tagList(
+        tags$p(class = "small text-muted", sprintf(
+          "%s passages, %s unique, one request each, %d at a time%s. Keep this tab open.",
+          format(n, big.mark = ","), format(n_u, big.mark = ","), workers,
+          if (is.null(secs)) "" else paste0(": about ", fmt_dur(secs)))),
+        if (is.null(conn())) tags$p(class = "small text-danger",
+                                  "Check the connection first (step 1)."))
     })
 
     # ---- the run -------------------------------------------------------------
@@ -259,19 +327,19 @@ mod_stance_server <- function(id) {
         showNotification("No passage is within the word bounds.", type = "warning")
         return()
       }
-      ep <- tryCatch(stance_endpoint(), error = function(e) {
-        showNotification(conditionMessage(e), type = "error", duration = NULL)
-        NULL
-      })
-      req(ep)
+      ep <- conn()
+      if (is.null(ep)) {
+        showNotification("Check the connection to the model first.", type = "warning")
+        return()
+      }
       todo <- dplyr::filter(p, keep)
       prompt <- stance_prompt(s, prop, trimws(input$kind %||% "") %|_|%
                                 "short text passages")
       t0 <- Sys.time()
-      # code_all reports after every chunk of requests, so the bar moves while
-      # they run in parallel
+      # stance_label_all reports after every chunk of requests, so the bar moves
+      # while they run in parallel
       lab <- withProgress(message = "Reading passages", value = 0, tryCatch(
-        code_all(todo$text, prompt, ep, s, workers, on_step = function(i, n)
+        stance_label_all(todo$text, prompt, ep, s, workers, on_step = function(i, n)
           setProgress(i / n, detail = sprintf("%s of %s unique", format(i, big.mark = ","),
                                               format(n, big.mark = ",")))),
         error = function(e) {
@@ -279,14 +347,17 @@ mod_stance_server <- function(id) {
           NULL
         }))
       req(lab)
-      todo$label <- lab
+      todo$label <- as.vector(lab)
+      todo$why <- attr(lab, "why")
+      # why a row has no label: outside the bounds, or the request's own reason
+      p$why[match(todo$stance_row, p$stance_row)] <- todo$why
       coded <- dplyr::filter(todo, !is.na(label))
       static <- stance_static(coded, s)
       trends <- if ("time" %in% names(coded)) stance_trends(coded, s) else NULL
       counts <- list(total = nrow(p), coded = nrow(coded),
                      excluded = sum(!p$keep) + sum(is.na(todo$label)),
                      documents = dplyr::n_distinct(coded$cluster))
-      run_id <- stance_run_id()
+      run_id <- stance_run_id(ep$model)
       labeled <- raw() |>
         dplyr::mutate(stance_run = run_id, stance_row = dplyr::row_number()) |>
         dplyr::left_join(dplyr::select(todo, stance_row, stance = label),
@@ -297,6 +368,7 @@ mod_stance_server <- function(id) {
                       stance_date = as.character(Sys.Date()))
       run(list(scheme = s, prop = prop, prompt = prompt, ep = ep, counts = counts,
                coded = coded, static = static, trends = trends,
+               unlabeled = todo$why[is.na(todo$label)],
                notes = attr(trends, "notes"),
                minutes = as.numeric(difftime(Sys.time(), t0, units = "mins")),
                # the three files, built once so the buttons only write them
@@ -320,6 +392,18 @@ mod_stance_server <- function(id) {
           format(r$counts$coded, big.mark = ","),
           format(r$counts$total, big.mark = ","),
           format(r$counts$documents, big.mark = ","), fmt_dur(r$minutes * 60))),
+        # passages that got no label are left out of the estimates; say why,
+        # one line per kind of reason with its first instance
+        if (length(r$unlabeled)) {
+          kinds <- split(r$unlabeled, sub(":.*", "", r$unlabeled))
+          tagList(
+            tags$p(class = "small text-danger mb-1", sprintf(
+              "%s passage(s) got no label and are left out of the estimates:",
+              format(length(r$unlabeled), big.mark = ","))),
+            tags$ul(class = "small text-danger", purrr::imap(kinds, function(w, k)
+              tags$li(format(length(w), big.mark = ","), " ", k, ", e.g. ",
+                      substr(sub("^[^:]*: ", "", w[1]), 1, 200)))))
+        },
         if (!stance_has_trend(r$trends)) tags$p(class = "small",
           tags$strong("Static estimate. "),
           if ("time" %in% names(r$coded))
@@ -470,7 +554,7 @@ stamp <- function() format(Sys.time(), "%Y%m%d_%H%M")
 fmt_dur <- function(sec) {
   if (sec < 90) return(sprintf("%.0f seconds", sec))
   if (sec < 5400) return(sprintf("%.0f minutes", sec / 60))
-  sprintf("%.1f hours", sec / 3600)
+  paste(round(sec / 3600, 1), "hours")
 }
 
 # "" or NA falls back to y; unlike %||%, which only catches NULL.

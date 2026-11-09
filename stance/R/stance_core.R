@@ -1,20 +1,15 @@
 # stance_core.R: stance coding and estimates. One copy, used by the stance app
 # and by stance.qmd (stance_source.R sources this file).
 #
-# The model is reached over a plain OpenAI-compatible endpoint, one passage per
-# request, several requests at a time (see code_all). The URL and model are
-# written into every result so each estimate records what produced it. They
-# are set in the calling script (app.R, or the config chunk of stance.qmd):
-#   url    base URL, e.g. "http://gemma-host:8000/v1"
-#   model  model name as the server knows it
-#   key    NULL when the server needs none (work). A key is never typed into a
-#          script: when one is needed (at home), NULL reads STANCE_KEY from
-#          .Renviron. It is sent as a bearer token, never written into a result
-#          or shown on a page.
-# A url or model left NULL falls back to STANCE_URL / STANCE_MODEL.
-#   reasoning_effort  sent only when set. "none" turns thinking off on Ollama
-#          (gemma4, qwen3), whose thinking otherwise uses up the short reply and
-#          leaves it empty. Leave NULL for a server that does not accept it.
+# Each passage goes to Claude Opus alone, in its own request, several requests
+# at a time (stance_label_all), through ellmer. The model is written into every
+# result so each estimate records what produced it.
+#
+# An endpoint (stance_endpoint) is the base URL, the model ID, the key, and the
+# requests allowed per minute. The key is sent with every request and never
+# written into a result or shown. The app passes the key the user pasted and
+# stance.qmd passes STANCE_KEY from .Renviron; nothing here reads the
+# environment, so the app can never pick up a key from the server.
 #
 # The data contract for the estimate functions is one row per passage:
 #   label    one of the scheme's codes, stance_codes(scheme)
@@ -92,21 +87,25 @@ stance_defaults <- list(
   min_class_n = 5L,  # passages a label needs, in and out, for a curve
   df_spline = 2L)
 
-stance_endpoint <- function(url = getOption("stance.url"),
+stance_reply_tokens <- 20L  # a one-word label needs a few tokens at most
+
+# ---- 1. The connection -------------------------------------------------------
+
+# Opus takes no temperature, and thinks by default, which would use up the
+# short reply; so requests go at its default sampling with thinking off.
+stance_settings <- list(thinking = list(type = "disabled"))
+
+stance_endpoint <- function(key, base_url = getOption("stance.base_url"),
                             model = getOption("stance.model"),
-                            key = getOption("stance.key"),
-                            reasoning_effort = getOption("stance.reasoning_effort")) {
-  ep <- list(url = url %||% Sys.getenv("STANCE_URL"),
-             model = model %||% Sys.getenv("STANCE_MODEL"),
-             key = key %||% Sys.getenv("STANCE_KEY"),
-             reasoning_effort = reasoning_effort)
-  if (!nzchar(ep$url) || !nzchar(ep$model))
-    stop("Set the model's URL and name: stance.url and stance.model in app.R ",
-         "(st$url and st$model in stance.qmd), or STANCE_URL and STANCE_MODEL.")
-  ep
+                            rpm = getOption("stance.rpm", 300)) {
+  if (!nzchar(key %||% ""))
+    stop("No API key: paste one and press Use this key (stance.qmd: STANCE_KEY in .Renviron).")
+  if (!nzchar(base_url %||% "") || !nzchar(model %||% ""))
+    stop("Set the model's base URL and ID.")
+  list(base_url = base_url, model = model, key = key, rpm = rpm)
 }
 
-# ---- 1. Coding ---------------------------------------------------------------
+# ---- 2. Coding ---------------------------------------------------------------
 
 # text_kind describes the passages, so the same prompt serves comments,
 # speeches, or survey answers. The prompt is built from the scheme and saved
@@ -151,78 +150,119 @@ stance_screen <- function(text, min_words = stance_defaults$min_words,
                            TRUE ~ NA_character_))
 }
 
-# One request: the claim's prompt as the system message, the passage as the
-# user message, temperature 0, a reply of a few words.
-stance_request <- function(text, prompt, ep) {
-  body <- list(model = ep$model, temperature = 0, max_tokens = 20,
-               messages = list(list(role = "system", content = prompt),
-                               list(role = "user", content = paste("Text:", text))))
-  body$reasoning_effort <- ep$reasoning_effort  # NULL adds nothing
-  req <- httr2::request(ep$url) |>
-    httr2::req_url_path_append("chat/completions") |>
-    httr2::req_body_json(body) |>
-    httr2::req_timeout(120) |>
-    httr2::req_retry(max_tries = 3)
-  if (nzchar(ep$key %||% "")) req <- httr2::req_auth_bearer_token(req, ep$key)
-  req
+# One reply per text, each sent alone with the prompt as the system prompt: the
+# reply's text, or the error when the request failed. parallel_chat() starts
+# every passage from the chat's system prompt, so each is its own conversation.
+# The key is passed explicitly: left NULL, ellmer would read ANTHROPIC_API_KEY.
+# A 429 or an overload is retried at the wait the provider asks for (httr2's
+# parallel queue sets no limit on tries), so a refusal slows a run down.
+stance_send <- function(texts, prompt, ep, workers = 1L) {
+  key <- ep$key
+  chat <- ellmer::chat_anthropic(
+    system_prompt = prompt, model = ep$model, base_url = ep$base_url,
+    params = ellmer::params(max_tokens = stance_reply_tokens), api_args = stance_settings,
+    cache = "none", credentials = function() key, echo = "none")
+  res <- withr::with_options(list(ellmer_timeout_s = ep$timeout %||% 120),
+    suppressWarnings(ellmer::parallel_chat(
+      chat, as.list(paste("Text:", texts)), max_active = workers,
+      on_error = "continue")))  # the per-minute limit is kept by stance_label_all
+  purrr::map(res, function(r) if (inherits(r, "Chat")) r$last_turn()@text else
+    r %||% simpleError("not sent"))
 }
 
-# A response to a label: the first label word in the reply, or NA with the
-# reason attached when the call failed or the reply holds no label.
-stance_parse <- function(resp, codes) {
-  if (inherits(resp, "error")) return(structure(NA_character_, error = conditionMessage(resp)))
-  reply <- tolower(httr2::resp_body_json(resp)$choices[[1]]$message$content %||% "")
-  hit <- regmatches(reply, regexpr(paste0("\\b(", paste(codes, collapse = "|"), ")\\b"), reply))
-  if (length(hit)) hit else structure(NA_character_, error = paste0("no label in reply: \"", reply, "\""))
+# The HTTP status of a failed request, NA when no response came back.
+status_of <- function(e)
+  if (inherits(e, "condition") && inherits(e$resp, "httr2_response"))
+    httr2::resp_status(e$resp) else NA_integer_
+
+# A condition's message, its causes included, on one line.
+error_text <- function(e) trimws(gsub("\\s+", " ", conditionMessage(e)))
+
+# Removes the key from a message, in case a provider echoes it back.
+scrub <- function(x, key) if (nzchar(key %||% "")) gsub(key, "<key>", x, fixed = TRUE) else x
+
+# Is the endpoint usable? One short request through the same path a run uses,
+# so a passing check means a run will get answers. Returns ok, a message that
+# names the problem (never the key), and the seconds the reply took.
+stance_check <- function(ep) {
+  t0 <- Sys.time()
+  reply <- stance_send("ready", "Reply with one word: ready.", c(ep, list(timeout = 30)))[[1]]
+  secs <- as.numeric(difftime(Sys.time(), t0, units = "secs"))
+  fail <- function(...) list(ok = FALSE, secs = secs, message = scrub(paste0(...), ep$key))
+  if (inherits(reply, "condition")) {
+    s <- status_of(reply)
+    hint <- if (is.na(s)) "The host could not be reached. " else
+      switch(as.character(s), "401" = , "403" = "The key was refused. ",
+             "404" = "The model or the URL was not found. ", "")
+    return(fail("No answer from ", ep$model, " at ", ep$base_url, ". ", hint, error_text(reply)))
+  }
+  if (!nzchar(trimws(reply)))
+    return(fail("The model answered with an empty reply; it may be spending the reply thinking."))
+  list(ok = TRUE, secs = secs,
+       message = sprintf("Connected to %s (replied in %.1f s).", ep$model, secs))
 }
 
-code_one <- function(text, prompt, ep, codes)
-  stance_parse(tryCatch(httr2::req_perform(stance_request(text, prompt, ep)),
-                        error = function(e) e), codes)
+# A reply to a label: the first label word in it, or NA with the reason
+# attached when the request failed or the reply holds no label.
+stance_parse <- function(reply, codes) {
+  if (inherits(reply, "condition"))
+    return(structure(NA_character_, why = paste("request failed:", error_text(reply))))
+  r <- tolower(dplyr::coalesce(as.character(reply)[1], ""))
+  hit <- regmatches(r, regexpr(paste0("\\b(", paste(codes, collapse = "|"), ")\\b"), r))
+  if (length(hit)) hit else structure(NA_character_, why = paste0("no label in reply: \"", r, "\""))
+}
 
-# Every passage, `workers` requests at a time. Identical passages are sent
-# once and the label is copied to every copy, since the same text with the same
-# prompt at temperature 0 gets the same label; each copy still counts as its
-# own passage in the estimates. The first unique passage goes alone as a
+now <- function() as.numeric(Sys.time())
+
+# Sleeps until k more requests fit, so no minute holds more than `rpm`. `sent`
+# holds, for each earlier request, a time no earlier than when it went (the end
+# of its chunk), so the count errs on the safe side.
+wait_for_window <- function(sent, k, rpm, window = 60) {
+  recent <- sort(sent[sent > now() - window])
+  over <- length(recent) + k - rpm
+  if (over > 0) Sys.sleep(max(0, recent[over] + window - now()) + 0.05)
+}
+
+# Labels for every passage, `workers` requests at a time. Identical passages
+# are sent once and the label is copied to every copy; each copy still counts
+# as its own passage in the estimates. The first unique passage goes alone as a
 # probe: if it fails, or the reply holds no label, the run stops with the
-# reason. The rest go in chunks of 10 x workers, and on_step(done, n) runs
-# after each chunk, so a progress bar moves while requests run in parallel.
-code_all <- function(text, prompt, ep, scheme, workers = 1L, on_step = function(i, n) NULL) {
-  if (length(text) == 0) stop("No passage to code.")
-  if (utils::packageVersion("httr2") < "1.1.1")
-    stop("httr2 1.1.1 or later is needed to send requests in parallel.")
+# reason. The rest go in chunks of 10 x workers, paced so no minute holds more
+# than ep$rpm, and on_step(done, n) runs after each, so a progress bar moves.
+# Returns one label per text, NA where there is none, with attr(, "why")
+# saying why for each NA.
+stance_label_all <- function(texts, prompt, ep, scheme, workers = 1L,
+                             on_step = function(i, n) NULL) {
+  if (length(texts) == 0) stop("No passage to code.")
   workers <- max(1L, as.integer(workers))
-  u <- unique(text)
-  n <- length(u)
   codes <- stance_codes(scheme)
-  probe <- code_one(u[[1]], prompt, ep, codes)
+  u <- unique(texts)
+  n <- length(u)
+  probe <- stance_parse(stance_send(u[1], prompt, ep)[[1]], codes)
   if (is.na(probe)) {
-    err <- attr(probe, "error")
-    stop(if (startsWith(err, "no label"))
+    why <- attr(probe, "why")
+    stop(scrub(if (startsWith(why, "no label"))
       paste0("The model answered, but its reply holds none of the labels (",
-             paste(codes, collapse = ", "), "): ", sub("^no label in reply: ", "", err),
-             ". An empty reply usually means the model spent its reply thinking: set ",
-             "reasoning_effort to \"none\" (st$reasoning_effort in stance.qmd, ",
-             "stance.reasoning_effort in app.R).")
-      else paste0("The model could not be reached or did not answer: ", err))
+             paste(codes, collapse = ", "), "): ", sub("^no label in reply: ", "", why),
+             ". An empty reply usually means the model spent its reply thinking.")
+      else paste0("The model could not be reached or did not answer: ",
+                  sub("^request failed: ", "", why)), ep$key))
   }
   on_step(1L, n)
   rest <- seq_len(n)[-1]
-  chunks <- split(rest, ceiling(seq_along(rest) / (10L * workers)))
-  res <- purrr::map(chunks, function(i) {
-    reqs <- purrr::map(u[i], function(t) stance_request(t, prompt, ep))
-    out <- purrr::map(httr2::req_perform_parallel(reqs, on_error = "continue",
-                                                  max_active = workers,
-                                                  progress = FALSE),
-                      stance_parse, codes)
+  run_chunk <- function(acc, i) {
+    wait_for_window(acc$sent, length(i), ep$rpm, getOption("stance.window_secs", 60))  # tests shorten it
+    acc$replies[i] <- stance_send(u[i], prompt, ep, workers)
+    acc$sent <- c(acc$sent, rep(now(), length(i)))
     on_step(max(i), n)
-    out
-  })
-  res <- c(list(probe), unlist(unname(res), recursive = FALSE))
-  lab <- purrr::map_chr(res, function(r) as.character(r))
-  if (all(is.na(lab)))
-    stop("No passage was labeled. First problem: ", attr(res[[1]], "error"))
-  lab[match(text, u)]
+    acc
+  }
+  acc <- purrr::reduce(split(rest, ceiling(seq_along(rest) / min(10L * workers, ep$rpm))),
+                       run_chunk, .init = list(replies = vector("list", n), sent = now()))
+  labs <- c(list(probe), purrr::map(acc$replies[-1], stance_parse, codes))
+  lab <- purrr::map_chr(labs, as.character)
+  why <- scrub(purrr::map_chr(labs, function(l) attr(l, "why") %||% NA_character_), ep$key)
+  structure(lab[match(texts, u)], why = why[match(texts, u)])
 }
 
 # A table of passages to code, from a file and the names of its columns. Both
@@ -260,7 +300,7 @@ stance_prepare <- function(raw, text_col, time_col = "", doc_col = "",
   d
 }
 
-# ---- 2. Time -----------------------------------------------------------------
+# ---- 3. Time -----------------------------------------------------------------
 
 # A time column becomes a number to model and a label to print. Years arrive
 # as numbers; months as "YYYY-MM" (or a Date), and become year + (month - 1)/12
@@ -282,7 +322,7 @@ stance_time <- function(x) {
   stop("The time column must be numeric (a year), \"YYYY-MM\", or a date.")
 }
 
-# ---- 3. Shares and curves ----------------------------------------------------
+# ---- 4. Shares and curves ----------------------------------------------------
 
 # Standard errors clustered on document, since passages from one document are
 # correlated (sandwich estimator written out to avoid a dependency).
@@ -337,7 +377,7 @@ trend_curve <- function(y, time, cluster, df_spline = stance_defaults$df_spline,
                  hi = stats::plogis(lp + 1.96 * se), df = df)
 }
 
-# ---- 4. The estimates --------------------------------------------------------
+# ---- 5. The estimates --------------------------------------------------------
 # A share of all passages confounds two things: how much the claim is
 # discussed, and which way the writers who discuss it lean. The two are
 # separated here, since P(favor) = P(addresses) x P(favor | addresses):
@@ -436,9 +476,10 @@ stance_table <- function(static, trends = NULL) {
 # A label for one run, written into every file the run produces. The hand-coded
 # sheet and the labeled file are matched on it later, so the check needs
 # nothing but the two files. Letters keep spreadsheets from reading it as a
-# number.
-stance_run_id <- function() paste0("run-", format(Sys.time(), "%Y%m%d-%H%M%S"), "-",
-                                   sprintf("%04x", sample.int(65535L, 1L)))
+# number, and the model ID at the end shows which model a sheet belongs to.
+stance_run_id <- function(model = "")
+  paste0("run-", format(Sys.time(), "%Y%m%d-%H%M%S"), "-", sprintf("%04x", sample.int(65535L, 1L)),
+         if (nzchar(model)) paste0("-", gsub("[^A-Za-z0-9.]+", "-", model)))
 
 # n coded passages drawn at random to code by hand. The model's label is not in
 # the file, so it cannot anchor the coder. The same run gives the same sheet.
@@ -496,13 +537,13 @@ stance_match <- function(labeled, sheet) {
 stance_record <- function(est, scheme, proposition, prompt, ep, counts) {
   if (is.null(est) || nrow(est) == 0) return(NULL)
   dplyr::mutate(est, scheme = scheme$id, proposition = proposition, model = ep$model,
-                endpoint = ep$url, passages_total = counts$total,
+                endpoint = ep$base_url, passages_total = counts$total,
                 passages_coded = counts$coded, passages_excluded = counts$excluded,
                 documents = counts$documents, date = as.character(Sys.Date()),
                 prompt = prompt)
 }
 
-# ---- 5. Plots ----------------------------------------------------------------
+# ---- 6. Plots ----------------------------------------------------------------
 
 stance_salience_color <- "#21918c"
 stance_colors <- function(scheme) c(salience = stance_salience_color, scheme$colors)
@@ -572,7 +613,7 @@ stance_plot_static <- function(static, scheme) {
                    strip.text.y.left = ggplot2::element_text(angle = 0, hjust = 0))
 }
 
-# ---- 6. Checking the labels against hand coding ------------------------------
+# ---- 7. Checking the labels against hand coding ------------------------------
 
 # Agreement, Cohen's kappa, and the confusion matrix for a set of passages a
 # person coded by hand. Intervals come from a bootstrap over documents (over

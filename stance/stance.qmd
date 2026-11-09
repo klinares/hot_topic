@@ -25,10 +25,8 @@ st <- list(
   proposition = "The United States should take an active role in the affairs of other nations.",
   name = "world_role",  # short name for this claim's output files
   hand_file = "",  # a CSV of hand codes in stance/inputs, to check the labels
-  url = "http://localhost:11434/v1",  # the model's base URL, ending in /v1
-  model = "gemma4:12b-it-qat",  # as the server names it (`ollama list`)
-  key = NULL,  # none at work; never type a key here (NULL reads STANCE_KEY)
-  reasoning_effort = "none",  # turns thinking off on Ollama; NULL if the server rejects it
+  url = "https://YOUR-ANTHROPIC-ENDPOINT/v1",  # the base URL, ending in /v1
+  model = "OPUS-ID",  # the model ID; the key comes from STANCE_KEY in .Renviron
   workers = 4L,  # requests sent to the model at once; 1 sends them one by one
   save_every = 200L)  # labels are saved after this many passages
 
@@ -38,7 +36,7 @@ suppressPackageStartupMessages({
 })
 theme_set(theme_minimal(base_size = 12))
 source(here::here("stance", "stance_source.R"))  # also sources R/stance_core.R
-ep <- stance_endpoint(st$url, st$model, st$key, st$reasoning_effort)
+ep <- stance_endpoint(Sys.getenv("STANCE_KEY"), st$url, st$model)  # never type a key here
 sch <- stance_scheme(st$scheme)
 d0 <- stance_defaults
 dir.create(p_out(""), showWarnings = FALSE)
@@ -48,7 +46,7 @@ dir.create(p_out(""), showWarnings = FALSE)
 
 Every passage in the corpus is read by a language model and labeled for its stance toward one claim. Nothing is sampled, so there is no sampling error and no weights. What is left is the variation of the shares themselves and the error in the labels, and only the first of those is in the intervals below.
 
-1. **Coding.** Each passage goes to the model alone, in its own request, at temperature 0, without its date or its document. `st$workers` requests run at once; identical passages are sent once and the label copied to each. The prompt is built from the scheme in `st$scheme` (`r sch$name`). The model first decides whether the passage addresses the claim at all (otherwise *irrelevant*), then which label fits.
+1. **Coding.** Each passage goes to the model alone, in its own request, without its date or its document. The model takes no temperature setting, so a repeat run can label a passage differently. `st$workers` requests run at once; identical passages are sent once and the label copied to each. The prompt is built from the scheme in `st$scheme` (`r sch$name`). The model first decides whether the passage addresses the claim at all (otherwise *irrelevant*), then which label fits.
 2. **Estimates.** Salience plus one quantity per label, because a share of all passages confounds two different things:
 
 $$P(\text{favor}) = P(\text{addresses}) \times P(\text{favor} \mid \text{addresses})$$
@@ -111,8 +109,8 @@ chunks <- split(texts, ceiling(seq_along(texts) / st$save_every))
 done <- purrr::reduce(seq_along(chunks), function(done, i) {
   u <- chunks[[i]]
   offset <- (i - 1) * st$save_every
-  lab <- code_all(u, prompt, ep, sch, st$workers,
-                  on_step = function(j, n) utils::setTxtProgressBar(pb, offset + j))
+  lab <- stance_label_all(u, prompt, ep, sch, st$workers,
+                          on_step = function(j, n) utils::setTxtProgressBar(pb, offset + j))
   d <- dplyr::filter(todo, text %in% u)
   out <- dplyr::bind_rows(done, tibble(stance_row = d$stance_row,
                                        label = lab[match(d$text, u)])) |>
