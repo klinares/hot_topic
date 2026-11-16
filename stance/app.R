@@ -1,33 +1,57 @@
 # app.R: the stance detector. A user pastes their API key, checks the
-# connection, uploads a CSV of short text passages, writes a claim, and every
-# passage is labeled by Claude Opus. Nothing is written to the server's disk:
-# the app works on what the user uploads, and results leave through the downloads.
+# connection, uploads a CSV of short text passages, and writes a claim.
 #
-# The base URL and model ID are fixed here and nowhere else; the user supplies
-# only the key. The key lives in that user's session: never saved, never in an
-# environment variable, never in a result, and the app reads no key from the
-# server. A run stays locked until Check connection has passed with that key.
+# Every chat model allows 300 requests per 4 hours, each on its own count, so
+# the app spends them carefully:
+#   - an embedding model (no limit) sorts the passages by closeness to the claim
+#   - the labeling model reads a random sample from every group, several
+#     passages to a request, and the sample is weighted up to the whole file
+#   - helper models read the same passages and more; the labeling model's
+#     sample measures and corrects their error, which narrows the intervals
+#   - the user sends a few requests at a time and adds more until the intervals
+#     are narrow enough, today or on another day
+# Nothing is written to the server's disk: results leave through the downloads,
+# and the downloaded file with labels is what a later visit adds to.
+#
+# The base URL and the model IDs are fixed here and nowhere else; the user
+# supplies only the key, which serves all of them. The key lives in that user's
+# session: never saved, never in an environment variable, never in a result,
+# and the app reads no key from the server. A run stays locked until Check
+# connection has passed with that key.
 #
 # On Posit Connect:
 #   - set "Max connections per process" to 1, because a run holds the R process
-#   - publish app.R, R/, and logo/
+#   - publish app.R, R/stance_core.R, R/stance_app.R, and logo/
 
 library(shiny)
 options(bitmapType = "cairo")  # the work server has no X11
 options(shiny.maxRequestSize = 500 * 1024^2)  # uploads up to 500 MB
+source("R/stance_core.R")  # the method: prompt, sample, requests, estimates
+source("R/stance_app.R")   # the pages
 
-# ---- the model -----------------------------------------------------------------
-# Paste the base URL (ellmer's ends in /v1: https://api.anthropic.com/v1) and the
-# model ID; the app will not start while a placeholder is left.
+# ---- the models ----------------------------------------------------------------
+# Paste the base URL (an OpenAI-compatible endpoint, ending in /v1) and the model
+# IDs; the app will not start while a placeholder is left. chat_model() takes
+# the ID and the request settings that model needs: Claude models take no
+# temperature and need thinking switched off; open models take temperature 0.
+# helpers = list() runs with the labeling model alone.
 options(
-  stance.base_url = "https://YOUR-ANTHROPIC-ENDPOINT/v1",
-  stance.model = "OPUS-ID",
-  stance.rpm = 300,     # requests allowed per minute; a run waits to stay under it
-  stance.workers = 4)   # requests sent at once
-if (any(grepl("YOUR-|^[A-Z0-9]+-ID$", c(getOption("stance.base_url"), getOption("stance.model")))))
-  stop("Paste the base URL and model ID into app.R.", call. = FALSE)
-
-purrr::walk(list.files("R", pattern = "\\.R$", full.names = TRUE), source)
+  stance.base_url = "https://YOUR-ENDPOINT/v1",
+  stance.models = stance_models(
+    embed = "EMBED-ID",
+    label = chat_model("SONNET-ID", thinking = list(type = "disabled")),
+    helpers = list(
+      chat_model("OPUS-ID", thinking = list(type = "disabled")),
+      chat_model("GEMMA-ID", temperature = 0, reasoning_effort = "none"),
+      chat_model("LLAMA-ID", temperature = 0))),
+  stance.batch = 30,        # requests offered per model per round (of 300 per 4 hours)
+  stance.per_request = 10,  # passages to a request; 1 sends each passage alone
+  stance.solo_n = 10,       # passages per round the labeling model also reads alone, as a check
+  stance.workers = 4)       # requests sent at once
+if (any(grepl("YOUR-|^[A-Z0-9]+-ID$", c(
+  getOption("stance.base_url"), getOption("stance.models")$embed$model,
+  purrr::map_chr(chat_models(getOption("stance.models")), "model")))))
+  stop("Paste the base URL and the model IDs into app.R.", call. = FALSE)
 
 # ---- the banner and the logo ---------------------------------------------------
 # The marking and the logo are fixed for this app. The logo is logo/office_logo.png;

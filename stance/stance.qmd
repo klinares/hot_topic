@@ -24,139 +24,177 @@ st <- list(
   scheme = "favor",
   proposition = "The United States should take an active role in the affairs of other nations.",
   name = "world_role",  # short name for this claim's output files
+  # labels wanted in total from the labeling model. Render, read the
+  # intervals, raise this, and render again: only the difference is sent.
+  n_label = 200L,
+  per_request = 10L,  # passages to a request; 1 sends each passage alone
+  solo_n = 10L,  # passages the labeling model also reads alone, as a check
   hand_file = "",  # a CSV of hand codes in stance/inputs, to check the labels
-  url = "https://YOUR-ANTHROPIC-ENDPOINT/v1",  # the base URL, ending in /v1
-  model = "OPUS-ID",  # the model ID; the key comes from STANCE_KEY in .Renviron
-  workers = 4L,  # requests sent to the model at once; 1 sends them one by one
-  save_every = 200L)  # labels are saved after this many passages
+  url = "https://YOUR-ENDPOINT/v1",  # the base URL, ending in /v1; the key is STANCE_KEY in .Renviron
+  embed_model = "EMBED-ID",  # sorts the passages by closeness to the claim
+  workers = 4L)  # requests sent to a model at once
+# The labeling model, then the helpers (list() for none). chat_model() takes the
+# ID and the request settings that model needs.
+st$model <- quote(chat_model("SONNET-ID", thinking = list(type = "disabled")))
+st$helpers <- quote(list(
+  chat_model("OPUS-ID", thinking = list(type = "disabled")),
+  chat_model("GEMMA-ID", temperature = 0, reasoning_effort = "none"),
+  chat_model("LLAMA-ID", temperature = 0)))
 
 suppressPackageStartupMessages({
   library(here); library(splines)
   library(tidyverse)  # tidyverse last so its verbs win
 })
 theme_set(theme_minimal(base_size = 12))
-source(here::here("stance", "stance_source.R"))  # also sources R/stance_core.R
-ep <- stance_endpoint(Sys.getenv("STANCE_KEY"), st$url, st$model)  # never type a key here
+source(here::here("stance", "R", "stance_core.R"))  # the same functions the app runs
+p_in <- function(f) here::here("stance", "inputs", f)
+p_out <- function(f) here::here("stance", "outputs", str_c("stance_", f, "_", st$name, ".csv"))
+dir.create(here::here("stance", "outputs"), showWarnings = FALSE)
+show <- function(df) writeLines(c("", knitr::kable(df, format = "pipe", digits = 3), ""))
+pc <- function(x) sprintf("%.1f%%", 100 * x)
+
+ep <- stance_endpoint(Sys.getenv("STANCE_KEY"), st$url,  # never type a key here
+                      stance_models(st$embed_model, eval(st$model), eval(st$helpers)))
+helper_ids <- purrr::map_chr(ep$models$helpers, "model")
 sch <- stance_scheme(st$scheme)
 d0 <- stance_defaults
-dir.create(p_out(""), showWarnings = FALSE)
+prompt <- stance_prompt(sch, st$proposition, st$text_kind)
 ```
 
 # The design
 
-Every passage in the corpus is read by a language model and labeled for its stance toward one claim. Nothing is sampled, so there is no sampling error and no weights. What is left is the variation of the shares themselves and the error in the labels, and only the first of those is in the intervals below.
+Every chat model may be sent only 300 requests in four hours, each model on its own count, and a corpus holds thousands of passages. So no model reads the corpus. The design spends the requests four ways.
 
-1. **Coding.** Each passage goes to the model alone, in its own request, without its date or its document. The model takes no temperature setting, so a repeat run can label a passage differently. `st$workers` requests run at once; identical passages are sent once and the label copied to each. The prompt is built from the scheme in `st$scheme` (`r sch$name`). The model first decides whether the passage addresses the claim at all (otherwise *irrelevant*), then which label fits.
-2. **Estimates.** Salience plus one quantity per label, because a share of all passages confounds two different things:
+1. **Screen.** An embedding model, which has no limit, places the claim and every passage in the same space. Passages are sorted by their similarity to the claim into `r length(d0$strata)` groups holding `r str_c(100 * d0$strata, collapse = ", ")` percent of the corpus, closest first. Nothing is dropped. The screen only decides where to look harder, so a poor screen costs precision, not correctness.
+2. **Sample and label.** The labeling model (`r ep$models$label$model`) reads a simple random sample from every group, the same number from each. The group closest to the claim is small, so it is read about ten times as closely as the farthest half of the corpus. Its labels are the instrument: the estimates are estimates of what this model would say about the whole corpus.
+3. **Several passages to a request.** The limit counts requests, not passages, so `r st$per_request` passages go in each request, numbered and in shuffled order, and the model returns one label per number. The prompt tells it to judge each on its own. Whether the company a passage keeps changes its label is measured, not assumed: `r st$solo_n` passages are also sent alone, and the two readings are compared below.
+4. **Helpers.** `r if (length(helper_ids)) str_c(helper_ids, collapse = ", ") else "None are configured. When they are, they"` read the same passages as the labeling model and further ones in the same random order, dealt out among them at random. Their labels are not trusted. On the passages both read, the labeling model's own frequencies translate each helper label into chances of its labels; those chances are totaled over everything the helpers read; and the labeling model's sample measures and removes what is left of the helpers' error. This is double sampling with a fallible classifier: the helpers can lean any way without biasing the result, and the closer they agree with the labeling model, the narrower the interval. A passage's own label never shapes its prediction (the passages both read are split in five, and each part is predicted from the others).
+5. **Weigh.** A labeled passage stands for the passages of its group that were not read: its weight is the passages in the group divided by those read in the group.
+
+Why not label only the passages closest to the claim and call the rest irrelevant? Because that assumes the answer. Passages that take a position by implication sit farther from the claim's wording, so a cutoff on similarity would understate how much the claim is discussed and would tilt the direction toward whichever side states its view outright. Sampling every group measures what the cutoff assumes, and the table of groups below shows it.
+
+**Adding labels.** Every passage has a fixed place in one random order. A group's sample is always its first passages in that order, so asking for more labels extends the same sample: 100 now and 100 later is the sample 200 would have drawn at once. Set `st$n_label` higher and render again; only the new passages are sent.
+
+**The estimates.** Salience plus one quantity per label, because a share of all passages confounds two different things:
 
 $$P(\text{favor}) = P(\text{addresses}) \times P(\text{favor} \mid \text{addresses})$$
 
-- **Salience** is the share of *all* passages that address the claim, that is $1 - P(\text{irrelevant})$. It says whether the claim is live in the corpus.
-- **The labels** (favor, neutral, oppose for the default) are shares of the passages that *do* address it. They say which way those writers lean.
+- **Salience** is the share of *all* passages that address the claim. It says whether the claim is live in the corpus.
+- **The labels** (`r str_c(sch$labels, collapse = ", ")`) are shares of the passages that *do* address it. They say which way those writers lean.
 
-Reported together, the two separate a rise in agreement from a rise in attention; a single combined share cannot tell them apart. Multiplying them back together recovers a share of all passages. The cost is that the direction estimates rest on a smaller base that moves over time, so a period can hold plenty of passages and still hold too few that address the claim. Each basis therefore gets its own period set, and the report says what was dropped.
+Each is a weighted share, with the labels estimated as a ratio of two weighted totals. The 95 percent intervals carry two things: only a sample was labeled, and passages from one document resemble each other. The variance is the linearized, with-replacement one for a stratified sample, with residuals taken within groups and summed by document; with helpers it has one such part for the helpers' sample and one for the labeling model's corrections. The interval is built on the logit scale. No finite-population correction is applied, so with every passage labeled the interval does not vanish; it becomes the document-clustered interval of a full reading. This choice is defensible rather than standard: documents cut across the sampling groups, which no textbook design covers exactly.
 
-Each quantity is modeled as a smooth function of time (a logistic regression on a natural spline, `df` = `r d0$df_spline`), and passages from one document are correlated, so the 95 percent intervals are clustered by document.
+What simulation on a corpus with a known answer showed. The sample is unbiased, and its intervals held the truth in 93 to 96 percent of samples from 200 labels up; for a label few passages carry they can fall to about 90 percent. Helpers that were wrong on one passage in ten or five, and leaned one way when wrong, did not bias the estimates, and intervals with them mostly erred wide (they held the truth 96 to 98 percent of the time; for the rarest label on 300 labels, 88 percent). The gain from helpers was modest: 10 to 30 percent narrower when they agreed with the labeling model on nine passages in ten and read the whole corpus, and little when they read only three times what it read. The large gain is from several passages to a request: ten times the labels is intervals about a third as wide. Helpers are used only once `r d0$min_assist_n` passages have been read by both.
 
-**The rules that decide whether there is a trend at all.** A period needs at least `r d0$min_period_n` passages to appear in one, and a trend needs at least `r d0$min_periods` such periods; otherwise time is dropped and the estimate is static for the whole corpus. Periods under the threshold are left out of the trend but stay in the static estimate. These thresholds are a judgment, not a standard: `r d0$min_period_n` is about where a share stops moving on one or two passages, and `r d0$min_periods` is the fewest periods on which a one-knot spline says anything a straight line would not.
+**Trends.** With a time column, each quantity is modeled as a smooth function of time, from the labeling model's sample alone: a weighted logistic regression on a natural spline (`df` = `r d0$df_spline`), intervals clustered by document. A trend needs `r d0$min_trend_n` labeled passages over `r d0$min_periods` periods on its own basis; otherwise the estimate is one number for the corpus. These thresholds are a judgment, not a standard.
 
-**Passage length.** Only passages between `r d0$min_words` and `r d0$max_words` words are coded. Below the floor there is not enough text to hold a position; above the ceiling the text is a document rather than a passage, holds several positions at once, and may run past the model's context. These bounds are a guard against the wrong unit of text. They are much wider than what has been tried, which is paragraphs of roughly 50 to 80 tokens.
+**Passage length.** Only passages between `r d0$min_words` and `r d0$max_words` words are sampled. Below the floor there is not enough text to hold a position; above the ceiling the text is a document rather than a passage and holds several positions at once.
 
-The app runs these same functions on a file a user uploads, so a claim submitted there is treated exactly as the one below.
+The app runs these same functions on a file a user uploads.
 
 **Scheme:** `r sch$name`
 
 **Claim:** `r st$proposition`
 
-**Model:** `r ep$model`
+**Models:** `r ep$models$label$model` labels; `r ep$models$embed$model` screens`r if (length(helper_ids)) str_c("; helpers: ", str_c(helper_ids, collapse = ", "))`
 
 # The corpus
 
 ```{r corpus}
 #| results: asis
-corpus_in <- p_in(st$file)
-raw <- readr::read_csv(corpus_in, show_col_types = FALSE)
+raw <- readr::read_csv(p_in(st$file), show_col_types = FALSE)
 paras <- stance_prepare(raw, st$text_col, st$time_col, st$doc_col)
+todo <- dplyr::filter(paras, keep)
 writeLines(glue::glue(
-  "{nrow(paras)} rows in {basename(corpus_in)}; {sum(paras$keep)} within the \\
-  word bounds, from {dplyr::n_distinct(paras$cluster[paras$keep])} document(s)."))
-if (any(!paras$keep))
-  dplyr::count(dplyr::filter(paras, !keep), why, name = "rows") |>
-    tbl_paged(caption = "Rows left uncoded.")
+  "{nrow(paras)} rows in {st$file}; {nrow(todo)} within the word bounds, \\
+  from {dplyr::n_distinct(todo$cluster)} document(s)."))
+if (any(!paras$keep)) show(dplyr::count(dplyr::filter(paras, !keep), why, name = "rows set aside"))
 ```
 
-# Coding
+# The sample
 
-Labels are saved every `r st$save_every` passages, so an interrupted run resumes where it stopped. Changing the claim, the scheme, or the model refuses the saved labels and names the file to delete; changing the corpus file does the same.
+The sample is saved with its labels, so a render reads it rather than sending passages again, and a larger `st$n_label` adds to it. A changed claim, scheme, description, model, or corpus is refused, and the message names the file to delete.
 
-```{r classify}
+```{r sample}
 #| results: asis
-labels_path <- p_out(str_c("stance_labels_", st$name, ".csv"))
-prompt_path <- p_out(str_c("stance_prompt_", st$name, ".txt"))
-prompt <- stance_prompt(sch, st$proposition, st$text_kind)
-writeLines(c(prompt, "", str_c("MODEL ", ep$model)), prompt_path)
-check_inputs(labels_path, c(corpus_in, prompt_path))
-
-done <- if (file.exists(labels_path))
-  readr::read_csv(labels_path, show_col_types = FALSE, col_types = "ic") else
-  tibble(stance_row = integer(), label = character())
-todo <- dplyr::filter(paras, keep) |> dplyr::anti_join(done, by = "stance_row")
-# identical passages are sent once, so the chunks are of unique texts and each
-# label is copied to every row that carries that text
-texts <- unique(todo$text)
-pb <- utils::txtProgressBar(max = max(1, length(texts)), style = 3, file = stderr())
-chunks <- split(texts, ceiling(seq_along(texts) / st$save_every))
-done <- purrr::reduce(seq_along(chunks), function(done, i) {
-  u <- chunks[[i]]
-  offset <- (i - 1) * st$save_every
-  lab <- stance_label_all(u, prompt, ep, sch, st$workers,
-                          on_step = function(j, n) utils::setTxtProgressBar(pb, offset + j))
-  d <- dplyr::filter(todo, text %in% u)
-  out <- dplyr::bind_rows(done, tibble(stance_row = d$stance_row,
-                                       label = lab[match(d$text, u)])) |>
-    dplyr::filter(!is.na(label))
-  readr::write_csv(out, labels_path)
-  record_inputs(labels_path, c(corpus_in, prompt_path))
-  out
-}, .init = done)
-close(pb)
-
-coded <- dplyr::inner_join(paras, done, by = "stance_row")
-if (nrow(coded) < sum(paras$keep))
-  writeLines(glue::glue("**{sum(paras$keep) - nrow(coded)} passages got no label;** re-render to retry them."))
-dplyr::count(coded, label) |>
-  dplyr::mutate(share = n / sum(n)) |>
-  tbl_paged(caption = glue::glue("Labels for {nrow(coded)} passages from {dplyr::n_distinct(coded$cluster)} document(s)."))
+labels_path <- p_out("labels")
+setup <- tibble::tibble(scheme = sch$id, claim = st$proposition, kind = st$text_kind,
+                        model = ep$models$label$model)
+if (file.exists(labels_path)) {
+  d <- readr::read_csv(labels_path, show_col_types = FALSE,
+                       col_types = readr::cols(similarity = "d", stratum = "i", draw = "i",
+                                               stance_row = "i", .default = "c"))
+  # a file from an earlier version, or for another claim or corpus, is not this sample
+  if (!all(c("draw", names(setup)) %in% names(d)) || !identical(d$text, todo$text) ||
+      !isTRUE(all.equal(dplyr::distinct(d, scheme, claim, kind, model), setup,
+                        check.attributes = FALSE)))
+    stop("The claim, scheme, description, model, or corpus changed since ",
+         basename(labels_path), " was written. Delete it and render again.")
+} else {
+  whole <- dplyr::n_distinct(todo$text) <= st$n_label  # small enough to label whole: no screen
+  d <- dplyr::bind_cols(
+    dplyr::select(todo, stance_row, text),
+    stance_frame(if (whole) rep(NA_real_, nrow(todo)) else
+      stance_similarity(todo$text, st$proposition, ep, st$workers)), setup)
+}
+more <- st$n_label - sum(!is.na(d$label))
+if (more > 0 && length(stance_pick(d, more))) {
+  requests <- min(ceiling(more / st$per_request) + st$solo_n, ep$models$label$limit)
+  d <- stance_run(d, requests, prompt, ep, sch, st$per_request, st$solo_n, st$workers)
+  writeLines(str_c("Requests sent: ", str_c(names(attr(d, "calls")), " ", attr(d, "calls"),
+                                            collapse = ", "), ".\n"))
+  purrr::walk(attr(d, "notes"), function(x) writeLines(str_c("**", x, "**\n")))
+  readr::write_csv(d, labels_path)  # the key is not in d
+}
+d$w <- stance_weights(d)
+full <- dplyr::bind_cols(dplyr::select(todo, -why, -text, -stance_row), d)
+coded <- dplyr::filter(full, !is.na(label))
+writeLines(glue::glue("{nrow(coded)} of {nrow(d)} passages labeled, in {max(d$stratum)} group(s); \\
+  helpers read {sum(!is.na(d$helper))}."))
+if (any(is.na(d$label) & !is.na(d$why)))
+  show(dplyr::count(dplyr::filter(d, is.na(label), !is.na(why)),
+                    reason = str_trunc(why, 70), name = "sampled, no label"))
+stance_groups(d) |>
+  dplyr::transmute(group = stratum, similarity = dplyr::coalesce(similarity, "not screened"),
+                   passages, labeled, `address the claim` = pc(addressing / labeled),
+                   `helpers only` = helper) |>
+  show()
 ```
 
-# What the labels look like
+The last column is the share of each group's labeled passages that address the claim. A group far from the claim that is not at zero is what a cutoff on similarity would have missed.
 
-```{r examples}
+```{r other-readings}
 #| results: asis
-withr::with_seed(2026L, coded |>
-  dplyr::filter(label != "irrelevant") |>
-  dplyr::group_by(label) |>
-  dplyr::slice_sample(n = 3) |>
-  dplyr::ungroup()) |>
-  dplyr::mutate(title = str_c(toupper(label), " | row ", stance_row),
-                text = str_trunc(text, 350)) |>
-  tbl_records("title", "text",
-              caption = "Three passages drawn at random for each label. If these do not match what the label should mean, fix the claim before reading any number.")
+checks <- stance_checks(d, sch)
+if (NROW(checks)) {
+  writeLines(glue::glue(
+    "Other readings against {ep$models$label$model}'s labels, on the passages both read. \\
+    The first row is the same model reading a passage alone: if it disagrees with itself, \\
+    several passages to a request is changing the answer, and `st$per_request` should be 1. \\
+    The other rows compare models. None of this says a label is right; only hand coding does."))
+  show(dplyr::transmute(checks, reading, passages, agreement = pc(agree),
+                        kappa = sprintf("%.2f (%.2f to %.2f)", kappa, kappa_lo, kappa_hi)))
+}
 ```
 
-# Results
+# Estimates
 
-```{r overall}
+```{r static}
 #| results: asis
-static <- stance_static(coded, sch)
+assist <- stance_assist(d, sch)
+static <- if (is.null(assist)) stance_static(coded, sch) else
+  stance_static(full[assist$both, ], sch, c(assist, list(cluster = full$cluster[assist$rows])))
+writeLines(if (is.null(assist)) "These shares rest on the labeling model's sample alone.\n" else
+  "These shares use the helpers, corrected by the labeling model's sample.\n")
 static |>
-  dplyr::select(quantity, basis, passages = n, share, lo, hi) |>
-  tbl_paged(caption = "The whole corpus, with 95 percent intervals clustered by document. Salience is out of all passages; the labels are out of the passages that address the claim.")
+  dplyr::transmute(quantity, `out of` = basis, `labeled passages` = n, share = pc(share),
+                   `95% low` = pc(lo), `95% high` = pc(hi)) |>
+  show()
 ```
 
 ```{r static-plot}
 #| fig-height: 3
-#| fig-cap: "The whole corpus. Intervals are 95 percent and do not include error in the model's labels."
+#| fig-cap: "The whole corpus. Intervals are 95 percent, carry the sampling and the documents, and do not include error in the model's labels."
 stance_plot_static(static, sch)
 ```
 
@@ -164,29 +202,20 @@ stance_plot_static(static, sch)
 #| results: asis
 trends <- if (nzchar(st$time_col)) stance_trends(coded, sch) else NULL
 purrr::walk(attr(trends, "notes"), function(x) writeLines(str_c("**", x, "**\n")))
-counts <- list(total = nrow(paras), coded = nrow(coded),
-               excluded = nrow(paras) - nrow(coded),
-               documents = dplyr::n_distinct(coded$cluster))
+counts <- list(total = nrow(paras), frame = nrow(d), labeled = nrow(coded),
+               groups = max(d$stratum), documents = dplyr::n_distinct(coded$cluster),
+               per_request = st$per_request, assisted = !is.null(assist))
 stance_record(stance_table(static, trends), sch, st$proposition, prompt, ep, counts) |>
-  readr::write_csv(p_out(str_c("stance_estimates_", st$name, ".csv")))
-if (!stance_has_trend(trends)) {
-  writeLines("No trend: time is not in the configuration, or too few periods are dense enough. The static estimate above is the result.\n")
-} else {
-  thin <- attr(trends, "periods")$salience
-  if (any(!thin$enough))
-    writeLines(glue::glue("Periods left out of the trends, under {d0$min_period_n} \\
-      passages: {str_c(thin$period[!thin$enough], collapse = ', ')}.\n"))
-  if (any(trends$df == 1L))
-    writeLines(glue::glue("A straight line in time, not a curve, for: \\
-      {str_c(unique(trends$quantity[trends$df == 1L]), collapse = ', ')}.\n"))
-}
+  readr::write_csv(p_out("estimates"))
+if (!stance_has_trend(trends))
+  writeLines("No trend: there is no time column, or too few labeled passages or periods. The static estimate above is the result.\n")
 ```
 
 ```{r trend-plots}
 #| fig-height: 3
 #| fig-cap:
-#|   - "Salience: the share of all passages that address the claim. Points are the observed share in each period, sized by the passages behind it. Intervals are 95 percent, clustered by document, and do not include error in the model's labels."
-#|   - "The labels among the passages that address the claim, on one scale because they are shares of the same passages and add to 100 percent. Points and intervals as in the salience figure."
+#|   - "Salience: the share of all passages that address the claim. Points are the weighted share observed in stretches of time, sized by the labeled passages behind them. Intervals are 95 percent, clustered by document, and do not include error in the model's labels."
+#|   - "The labels among the passages that address the claim, on one scale because they add to 100 percent. Points and intervals as in the salience figure."
 if (stance_has_trend(trends)) {
   obs <- stance_observed(coded, sch)
   print(stance_plot_salience(trends, obs))
@@ -196,51 +225,43 @@ if (stance_has_trend(trends)) {
 
 # Checking the labels
 
-The intervals above treat the labels as correct. They are not, and nothing in the pipeline measures how often they are wrong. The only way to find out is to code some passages by hand and compare.
+The intervals above treat the labels as correct. They are not, and nothing in the pipeline measures how often they are wrong. The only way to find out is to code passages by hand and compare.
 
-Draw 400 at random, code them without seeing the model's label, and read three things: overall agreement, Cohen's kappa, and the confusion matrix. 400 puts agreement within about 5 percentage points, which is enough to tell a usable coder from a broken one. It is not enough to say much about a label the model rarely uses: a label on 5 percent of passages turns up about 20 times, and 20 cases carry roughly 18 points of uncertainty, so read the per-label rows with their counts beside them.
+The sheet holds the labeled passages (400 at random when there are more), without the model's label. Code as many as you can: 100 hand codes put overall agreement within about 10 percentage points, 400 within about 5. That is not enough to say much about a label the model rarely uses, so read the per-label rows with their counts. Agreement and kappa are weighted like the estimates, so they describe the corpus and not only the sample, which leans toward passages close to the claim.
 
 Two cautions. One coder is a weak standard, so for a decision that matters have a second person code a subset and compare the coders first. And agreement alone hides direction: a model that pushes everything into one label can still agree often when that label is common, which shows up in the confusion matrix as a filled column.
 
-```{r handcode-sheet}
+```{r handcode}
 #| results: asis
-sheet <- p_out(str_c("stance_handcode_", st$name, ".csv"))
-readr::write_csv(stance_sheet(coded, sch, st$proposition), sheet)
-writeLines(glue::glue("Wrote {basename(sheet)}: 400 passages with a blank \\
-  `hand_label` column and no model label. Code it, put it in stance/inputs, \\
-  and name it in `st$hand_file` to see the comparison here."))
-```
-
-```{r handcode-check}
-#| results: asis
+readr::write_csv(stance_sheet(coded, sch, st$proposition), p_out("handcode"))
 if (nzchar(st$hand_file)) {
   hand <- readr::read_csv(p_in(st$hand_file), show_col_types = FALSE) |>
     dplyr::transmute(stance_row = as.integer(stance_row),
                      hand_label = str_to_lower(str_trim(hand_label))) |>
     dplyr::filter(!is.na(hand_label), hand_label != "") |>
-    dplyr::inner_join(dplyr::select(coded, stance_row, label, cluster),
-                      by = "stance_row")
-  a <- stance_agreement(hand$hand_label, hand$label, hand$cluster, sch)
+    dplyr::inner_join(dplyr::select(coded, stance_row, label, cluster, w), by = "stance_row")
+  a <- stance_agreement(hand$hand_label, hand$label, hand$cluster, sch, hand$w)
   writeLines(glue::glue(
-    "{a$n} passages from {a$documents} document(s). Agreement \\
-    {sprintf('%.1f%%', 100 * a$agree)} (95% {sprintf('%.1f', 100 * a$agree_ci[1])} \\
-    to {sprintf('%.1f', 100 * a$agree_ci[2])}). Cohen's kappa \\
+    "{a$n} passages from {a$documents} document(s). Agreement {pc(a$agree)} \\
+    (95% {pc(a$agree_ci[1])} to {pc(a$agree_ci[2])}). Cohen's kappa \\
     {sprintf('%.2f', a$kappa)} (95% {sprintf('%.2f', a$kappa_ci[1])} to \\
     {sprintf('%.2f', a$kappa_ci[2])}), from a bootstrap over documents.\n"))
-  as.data.frame(a$confusion) |>
-    tidyr::pivot_wider(names_from = model, values_from = Freq) |>
-    tbl_paged(caption = "Confusion matrix: rows are the hand labels, columns the model's. The diagonal is agreement.")
-  stance_by_label(a) |>
-    tbl_paged(caption = "Per label. recall: of the passages a person gave this label, the share the model agreed on. precision: of the model's passages with this label, the share the person agreed on. thin: fewer than 30 hand codes, so the row is a hint rather than a measurement.")
+  writeLines("Confusion matrix: rows are the hand labels, columns the model's.")
+  show(tidyr::pivot_wider(as.data.frame(a$confusion), names_from = model, values_from = Freq))
+  writeLines("Per label. thin: fewer than 30 hand codes, so the row is a hint, not a measurement.")
+  show(stance_by_label(a))
 } else {
-  writeLines("No hand codes configured, so **the accuracy of these labels is unmeasured.** Say so wherever the estimates are reported.")
+  writeLines(glue::glue(
+    "Wrote {basename(p_out('handcode'))}. Code its `hand_label` column, put the file in \\
+    stance/inputs, and name it in `st$hand_file`. Until then **the accuracy of these \\
+    labels is unmeasured.** Say so wherever the estimates are reported."))
 }
 ```
 
 # Before using these numbers
 
+- The estimates rest on `r nrow(coded)` labeled passages. Direction rests on the `r sum(coded$label != "irrelevant")` of them that address the claim, which is why its intervals are the wide ones. More labels narrow both.
 - The labels come from one model. Their error is not in the intervals.
-- Wording moves the answer. Re-run with a paraphrase of the claim and compare before relying on a result.
+- Wording moves the answer. Run a paraphrase of the claim and compare before relying on a result.
 - Every share is a share of passages, so a long document contributes more than a short one. The document column makes the intervals account for that; it does not make the shares equal per document.
 - The corpus is not a sample of anything wider. The estimates describe this corpus.
-- Gaps in time are never drawn as observed: a period with no passages, or too few, is absent from the curve rather than interpolated across.
