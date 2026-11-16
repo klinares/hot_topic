@@ -784,10 +784,7 @@ stance_help_ui <- function() {
                "Points 2 to 5 follow ", li_conrad, ": ",
                tags$em("Advancing annotation of stance in social media posts: A ",
                        "comparative analysis of large language models and crowd ",
-                       "sourcing", .noWS = "after"), ", arXiv:2406.07483."))),
-    tags$p(class = "small text-muted mt-2",
-      tags$a(href = "https://github.com/klinares/hot_topic/blob/main/stance/stance.pdf",
-             target = "_blank", "Method report (PDF)")))
+                       "sourcing", .noWS = "after"), ", arXiv:2406.07483."))))
 }
 
 # ---- choosing what to measure ------------------------------------------------
